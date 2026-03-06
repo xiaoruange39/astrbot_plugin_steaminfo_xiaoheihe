@@ -1,3 +1,5 @@
+![:name](https://count.getloli.com/@astrbot_plugin_steaminfo_xiaoheihe?name=astrbot_plugin_steaminfo_xiaoheihe&theme=green&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto&prefix=0)
+
 # astrbot_plugin_steaminfo_xiaoheihe
 
 一个为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的插件，通过小黑盒搜索游戏并截图返回详情页，同时支持自动解析聊天中的小黑盒链接并截图回复。
