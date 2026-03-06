@@ -3,6 +3,7 @@ import json
 import asyncio
 import os
 import tempfile
+import uuid
 from urllib.parse import quote
 
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -27,10 +28,10 @@ class XiaoheihePlugin(Star):
         # 读取配置
         self.require_prefix: bool = config.get("require_prefix", True)
         self.cookies: str = config.get("cookies", "")
-        self.wait_timeout: int = config.get("wait_timeout", 60000)
-        self.render_delay: int = config.get("render_delay", 5000)
-        self.device_scale_factor: float = config.get("device_scale_factor", 2)
-        self.image_quality: int = config.get("image_quality", 95)
+        self.wait_timeout: int = int(config.get("wait_timeout", 60000))
+        self.render_delay: int = int(config.get("render_delay", 5000))
+        self.device_scale_factor: float = float(config.get("device_scale_factor", 2))
+        self.image_quality: int = int(config.get("image_quality", 95))
         self.show_game_title: bool = config.get("show_game_title", True)
         self.show_online_count: bool = config.get("show_online_count", True)
         self.enable_link_preview: bool = config.get("enable_link_preview", True)
@@ -127,54 +128,10 @@ class XiaoheihePlugin(Star):
             self._log(f"导航到搜索页面: {search_url}")
             await page.goto(search_url, wait_until="load", timeout=self.wait_timeout)
 
-            final_url = None
-            navigation_completed = False
+            # 多重降级策略寻找并导航到游戏详情页
+            navigation_success = await self._navigate_to_game_page(page, short_timeout, mid_timeout)
 
-            # Plan A: 寻找列表页的游戏链接
-            list_game_selector = 'a[href*="/app/topic/game/"]'
-            self._log(f'[Plan A] 尝试寻找列表页的游戏链接: "{list_game_selector}"')
-            try:
-                await page.wait_for_selector(list_game_selector, timeout=short_timeout)
-                game_page_href = await page.get_attribute(list_game_selector, "href")
-                final_url = f"https://www.xiaoheihe.cn{game_page_href}"
-                self._log(f"[Plan A] 成功！获取到链接: {final_url}")
-            except Exception:
-                self._log("[Plan A] 失败")
-
-            if not final_url and not navigation_completed:
-                # Plan B: 尝试社区中转策略
-                self._log("尝试切换到 Plan B...")
-                try:
-                    community_link_selector = ".search-topic__topic-name"
-                    self._log(f'[Plan B] 寻找社区链接: "{community_link_selector}"')
-                    await page.wait_for_selector(community_link_selector, timeout=short_timeout)
-                    async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
-                        await page.click(community_link_selector)
-
-                    game_tab_selector = ".slide-tab__tab-label"
-                    await page.wait_for_selector(game_tab_selector, timeout=mid_timeout)
-                    async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
-                        await page.click(game_tab_selector)
-
-                    navigation_completed = True
-                    self._log(f"[Plan B] 成功到达最终游戏页面: {page.url}")
-                except Exception:
-                    self._log("[Plan B] 失败")
-
-            if not final_url and not navigation_completed:
-                # Plan C: 尝试点击独立游戏卡片
-                self._log("尝试切换到 Plan C...")
-                try:
-                    single_game_card_selector = ".search-result__game .game-rank__game-card"
-                    self._log(f'[Plan C] 寻找并点击独立游戏卡片: "{single_game_card_selector}"')
-                    await page.wait_for_selector(single_game_card_selector, timeout=short_timeout)
-                    await page.click(single_game_card_selector)
-                    navigation_completed = True
-                    self._log("[Plan C] 点击成功！")
-                except Exception:
-                    self._log("[Plan C] 失败")
-
-            if not final_url and not navigation_completed:
+            if not navigation_success:
                 self._log("所有方案均失败。")
                 # 截取当前搜索页作为反馈
                 screenshot_bytes = await page.screenshot(full_page=True)
@@ -183,13 +140,6 @@ class XiaoheihePlugin(Star):
                 yield event.image_result(screenshot_path)
                 self._schedule_cleanup(screenshot_path)
                 return
-
-            # 导航到游戏详情页
-            if not navigation_completed:
-                self._log(f"正在导航到: {final_url}")
-                await page.goto(
-                    final_url, wait_until="load", timeout=self.wait_timeout
-                )
 
             # 等待核心内容
             main_content_selector = ".game-detail-page-detail"
@@ -308,6 +258,54 @@ class XiaoheihePlugin(Star):
                 await context.close()
                 self._log("浏览器上下文已关闭。")
 
+    async def _navigate_to_game_page(self, page, short_timeout: int, mid_timeout: int) -> bool:
+        """尝试多种方案导航到游戏详情页"""
+        # Plan A: 寻找列表页的游戏链接
+        list_game_selector = 'a[href*="/app/topic/game/"]'
+        self._log(f'[Plan A] 尝试寻找列表页的游戏链接: "{list_game_selector}"')
+        try:
+            await page.wait_for_selector(list_game_selector, timeout=short_timeout)
+            game_page_href = await page.get_attribute(list_game_selector, "href")
+            final_url = f"https://www.xiaoheihe.cn{game_page_href}"
+            self._log(f"[Plan A] 成功！获取到链接: {final_url}")
+            self._log(f"正在导航到: {final_url}")
+            await page.goto(final_url, wait_until="load", timeout=self.wait_timeout)
+            return True
+        except Exception:
+            self._log("[Plan A] 失败")
+
+        # Plan B: 尝试社区中转策略
+        self._log("尝试切换到 Plan B...")
+        try:
+            community_link_selector = ".search-topic__topic-name"
+            self._log(f'[Plan B] 寻找社区链接: "{community_link_selector}"')
+            await page.wait_for_selector(community_link_selector, timeout=short_timeout)
+            async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
+                await page.click(community_link_selector)
+
+            game_tab_selector = ".slide-tab__tab-label"
+            await page.wait_for_selector(game_tab_selector, timeout=mid_timeout)
+            async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
+                await page.click(game_tab_selector)
+            self._log(f"[Plan B] 成功到达最终游戏页面: {page.url}")
+            return True
+        except Exception:
+            self._log("[Plan B] 失败")
+
+        # Plan C: 尝试点击独立游戏卡片
+        self._log("尝试切换到 Plan C...")
+        try:
+            single_game_card_selector = ".search-result__game .game-rank__game-card"
+            self._log(f'[Plan C] 寻找并点击独立游戏卡片: "{single_game_card_selector}"')
+            await page.wait_for_selector(single_game_card_selector, timeout=short_timeout)
+            await page.click(single_game_card_selector)
+            self._log("[Plan C] 点击成功！")
+            return True
+        except Exception:
+            self._log("[Plan C] 失败")
+
+        return False
+
     # ==================== 链接解析 ====================
 
     def _extract_xiaoheihe_url(self, event: AstrMessageEvent) -> str | None:
@@ -341,7 +339,7 @@ class XiaoheihePlugin(Star):
                     raw_data = raw_data.get("data", raw_data)
 
                 # 尝试做全文正则搜索
-                json_text = json.dumps(raw_data, ensure_ascii=False) if isinstance(raw_data, dict) else str(raw_data)
+                json_text = json.dumps(raw_data, ensure_ascii=False) if isinstance(raw_data, (dict, list)) else str(raw_data)
                 m = url_pattern.search(json_text)
                 if m:
                     return m.group(0)
@@ -359,14 +357,13 @@ class XiaoheihePlugin(Star):
         if not self.require_prefix:
             content_stripped = content.strip()
             # 匹配"小黑盒xxx"或"xiaoheihexxx"，允许中间有或者没有空格
-            match = re.match(r'^(?:小黑盒|xiaoheihe)\s*(.+)$', content_stripped, re.IGNORECASE)
+            match = re.match(r'^(?:小黑盒|xiaoheihe)\s*(.*)$', content_stripped, re.IGNORECASE)
             if match:
                 game = match.group(1).strip()
-                if game:
-                    self._log(f"检测到无前缀触发指令: {game}")
-                    async for result in self.cmd_xiaoheihe(event, game):
-                        yield result
-                    return
+                self._log("检测到无前缀触发指令")
+                async for result in self.cmd_xiaoheihe(event, game):
+                    yield result
+                return
 
         if not self.enable_link_preview:
             return
@@ -470,7 +467,7 @@ class XiaoheihePlugin(Star):
         """保存临时截图并返回文件路径"""
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(
-            temp_dir, f"xiaoheihe_{id(image_bytes)}_{asyncio.get_running_loop().time()}.jpg"
+            temp_dir, f"xiaoheihe_{uuid.uuid4().hex}.jpg"
         )
         with open(file_path, "wb") as f:
             f.write(image_bytes)
