@@ -1,6 +1,8 @@
 import re
 import json
 import asyncio
+import os
+import tempfile
 
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
@@ -37,6 +39,9 @@ class XiaoheihePlugin(Star):
         self._playwright = None
         self._browser: Browser | None = None
         self._browser_lock = asyncio.Lock()
+        
+        # 限制并发截图数量，防止 OOM
+        self._semaphore = asyncio.Semaphore(2)
 
     def _log(self, message: str):
         """调试日志"""
@@ -100,6 +105,11 @@ class XiaoheihePlugin(Star):
         yield event.plain_result("请求已收到，正在为您生成游戏截图，请稍候... 🎮")
         self._log(f'收到截图请求，游戏名称: "{game}"')
 
+        async with self._semaphore:
+            async for result in self._process_screenshot(event, game):
+                yield result
+
+    async def _process_screenshot(self, event: AstrMessageEvent, game: str):
         context = None
         try:
             context = await self._create_context()
@@ -282,6 +292,7 @@ class XiaoheihePlugin(Star):
             if text_lines:
                 yield event.plain_result("\n".join(text_lines))
             yield event.image_result(image_path)
+            self._schedule_cleanup(image_path)
 
         except Exception as e:
             error_msg = "截图失败，请检查控制台错误日志。"
@@ -326,47 +337,11 @@ class XiaoheihePlugin(Star):
                 if isinstance(raw_data, dict):
                     raw_data = raw_data.get("data", raw_data)
 
-                # 将 JSON 字符串解析为 dict
-                json_str = raw_data if isinstance(raw_data, str) else ""
-                if not json_str:
-                    # 如果无法取得字符串，尝试对整个 raw_data 做全文搜索
-                    full_text = str(raw_data)
-                    m = url_pattern.search(full_text)
-                    if m:
-                        return m.group(0)
-                    continue
-
-                try:
-                    card = json.loads(json_str)
-                except (json.JSONDecodeError, TypeError):
-                    # 解析失败也做全文搜索
-                    m = url_pattern.search(json_str)
-                    if m:
-                        return m.group(0)
-                    continue
-
-                # 在解析后的 JSON 中递归搜索 URL
-                # 常见路径: meta.detail_1.qqdocurl, meta.news.jumpUrl 等
-                def find_url_in_dict(d):
-                    if isinstance(d, dict):
-                        for v in d.values():
-                            result = find_url_in_dict(v)
-                            if result:
-                                return result
-                    elif isinstance(d, list):
-                        for item in d:
-                            result = find_url_in_dict(item)
-                            if result:
-                                return result
-                    elif isinstance(d, str):
-                        m = url_pattern.search(d)
-                        if m:
-                            return m.group(0)
-                    return None
-
-                found = find_url_in_dict(card)
-                if found:
-                    return found
+                # 尝试做全文正则搜索
+                json_text = json_str if json_str else str(raw_data)
+                m = url_pattern.search(json_text)
+                if m:
+                    return m.group(0)
         except Exception as e:
             self._log(f"解析 JSON 卡片消息时出错: {e}")
 
@@ -380,18 +355,15 @@ class XiaoheihePlugin(Star):
         # 0. 无前缀触发逻辑
         if not self.require_prefix:
             content_stripped = content.strip()
-            # 匹配"小黑盒 xxx"或"xiaoheihe xxx"（支持空格或换行分隔）
-            if content_stripped.startswith("小黑盒") or content_stripped.startswith("xiaoheihe"):
-                # 提取纯文本前缀
-                prefix = "小黑盒" if content_stripped.startswith("小黑盒") else "xiaoheihe"
-                # 检查紧跟的是否为空白字符
-                if len(content_stripped) > len(prefix) and content_stripped[len(prefix)].isspace():
-                    game = content_stripped[len(prefix):].strip()
-                    if game:
-                        self._log("检测到无前缀触发指令")
-                        async for result in self.cmd_xiaoheihe(event, game):
-                            yield result
-                        return
+            # 匹配"小黑盒xxx"或"xiaoheihexxx"，允许中间有或者没有空格
+            match = re.match(r'^(?:小黑盒|xiaoheihe)\s*(.+)$', content_stripped, re.IGNORECASE)
+            if match:
+                game = match.group(1).strip()
+                if game:
+                    self._log(f"检测到无前缀触发指令: {game}")
+                    async for result in self.cmd_xiaoheihe(event, game):
+                        yield result
+                    return
 
         if not self.enable_link_preview:
             return
@@ -403,7 +375,12 @@ class XiaoheihePlugin(Star):
         self._log(f"检测到小黑盒链接，开始截图: {target_url}")
 
         yield event.plain_result("检测到小黑盒链接，正在为您生成截图，请稍候...")
+        
+        async with self._semaphore:
+            async for result in self._process_link_screenshot(event, target_url):
+                yield result
 
+    async def _process_link_screenshot(self, event: AstrMessageEvent, target_url: str):
         context = None
         try:
             context = await self._create_context()
@@ -468,6 +445,7 @@ class XiaoheihePlugin(Star):
 
             image_path = self._save_temp_image(image_bytes)
             yield event.image_result(image_path)
+            self._schedule_cleanup(image_path)
             self._log("链接解析截图完成")
 
         except Exception as e:
@@ -482,9 +460,6 @@ class XiaoheihePlugin(Star):
 
     def _save_temp_image(self, image_bytes: bytes) -> str:
         """保存临时截图并返回文件路径"""
-        import tempfile
-        import os
-
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(
             temp_dir, f"xiaoheihe_{id(image_bytes)}_{asyncio.get_event_loop().time()}.jpg"
@@ -493,6 +468,18 @@ class XiaoheihePlugin(Star):
             f.write(image_bytes)
         self._log(f"临时截图已保存: {file_path}")
         return file_path
+
+    def _schedule_cleanup(self, file_path: str, delay: float = 10.0):
+        """延迟清理临时文件，确保图片发送完成后再删除"""
+        def cleanup():
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    self._log(f"已清理临时截图: {file_path}")
+            except Exception as e:
+                self._log(f"清理临时截图失败 {file_path}: {e}")
+        
+        asyncio.get_event_loop().call_later(delay, cleanup)
 
     # ==================== 生命周期 ====================
 
