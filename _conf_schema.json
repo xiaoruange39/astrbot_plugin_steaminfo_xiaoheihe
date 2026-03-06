@@ -1,0 +1,62 @@
+{
+    "require_prefix": {
+        "description": "启用指令前缀触发",
+        "type": "bool",
+        "hint": "开启后，必须使用指令前缀（如 /小黑盒）才能触发搜索；关闭后，直接发送“小黑盒 <游戏名>”或“xiaoheihe <游戏名>”亦可无前缀触发。",
+        "default": true
+    },
+    "cookies": {
+        "description": "小黑盒 Cookie（建议填写）",
+        "type": "string",
+        "hint": "登录小黑盒后获取的 Cookie 字符串。填写后可正常使用搜索功能并访问需要登录才能查看的内容。获取方式详见 README。",
+        "default": ""
+    },
+    "wait_timeout": {
+        "description": "页面加载超时时间（毫秒）",
+        "type": "int",
+        "hint": "页面加载的超时时间，单位毫秒。",
+        "default": 60000
+    },
+    "render_delay": {
+        "description": "额外渲染等待时间（毫秒）",
+        "type": "int",
+        "hint": "在内容框架出现后，额外等待渲染的时间（毫秒），以确保图片等动态内容加载完成。",
+        "default": 5000
+    },
+    "device_scale_factor": {
+        "description": "截图清晰度（设备缩放因子）",
+        "type": "float",
+        "hint": "设置截图的设备缩放因子。设置为 2 可让文字更加清晰。取值范围 1~3。",
+        "default": 2
+    },
+    "image_quality": {
+        "description": "图片质量（JPEG）",
+        "type": "int",
+        "hint": "JPEG 格式的图片质量，取值 1~100。",
+        "default": 95
+    },
+    "show_game_title": {
+        "description": "截图前显示游戏名",
+        "type": "bool",
+        "hint": "是否在截图前以文本形式显示游戏名称。",
+        "default": true
+    },
+    "show_online_count": {
+        "description": "截图前显示当前在线人数",
+        "type": "bool",
+        "hint": "是否在截图前以文本形式显示当前在线人数。",
+        "default": true
+    },
+    "enable_link_preview": {
+        "description": "自动解析小黑盒链接",
+        "type": "bool",
+        "hint": "启用后，当用户发送小黑盒链接时，插件会自动对该链接进行截图并回复。",
+        "default": true
+    },
+    "debug": {
+        "description": "调试模式",
+        "type": "bool",
+        "hint": "启用后，将在控制台输出详细的调试日志。",
+        "default": false
+    }
+}

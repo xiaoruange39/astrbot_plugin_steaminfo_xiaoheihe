@@ -1,0 +1,6 @@
+name: astrbot_plugin_steaminfo_xiaoheihe
+display_name: 小黑盒游戏截图
+desc: 通过小黑盒网站搜索并生成截图获取 Steam 游戏信息，支持小黑盒链接自动解析截图。
+version: v1.0.0
+author: xiaoruange39
+repo: https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe
