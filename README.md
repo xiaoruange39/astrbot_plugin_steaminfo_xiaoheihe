@@ -128,6 +128,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 
 本插件使用 [MIT License](./LICENSE) 授权。
 
-[QQ群](https://qm.qq.com/q/8kdJ2Bzf6S)
+## 👤 作者
 
-© 2026, xiaoruange39.
+- **xiaoruange39**
+- **[QQ群](https://qm.qq.com/q/8kdJ2Bzf6S)**
