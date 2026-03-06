@@ -114,6 +114,9 @@ class XiaoheihePlugin(Star):
                 yield result
 
     async def _process_screenshot(self, event: AstrMessageEvent, game: str):
+        short_timeout = max(3000, self.wait_timeout // 12)
+        mid_timeout = max(5000, self.wait_timeout // 6)
+
         context = None
         try:
             context = await self._create_context()
@@ -131,7 +134,7 @@ class XiaoheihePlugin(Star):
             list_game_selector = 'a[href*="/app/topic/game/"]'
             self._log(f'[Plan A] 尝试寻找列表页的游戏链接: "{list_game_selector}"')
             try:
-                await page.wait_for_selector(list_game_selector, timeout=5000)
+                await page.wait_for_selector(list_game_selector, timeout=short_timeout)
                 game_page_href = await page.get_attribute(list_game_selector, "href")
                 final_url = f"https://www.xiaoheihe.cn{game_page_href}"
                 self._log(f"[Plan A] 成功！获取到链接: {final_url}")
@@ -144,12 +147,12 @@ class XiaoheihePlugin(Star):
                 try:
                     community_link_selector = ".search-topic__topic-name"
                     self._log(f'[Plan B] 寻找社区链接: "{community_link_selector}"')
-                    await page.wait_for_selector(community_link_selector, timeout=5000)
+                    await page.wait_for_selector(community_link_selector, timeout=short_timeout)
                     async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
                         await page.click(community_link_selector)
 
                     game_tab_selector = ".slide-tab__tab-label"
-                    await page.wait_for_selector(game_tab_selector, timeout=10000)
+                    await page.wait_for_selector(game_tab_selector, timeout=mid_timeout)
                     async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
                         await page.click(game_tab_selector)
 
@@ -164,7 +167,7 @@ class XiaoheihePlugin(Star):
                 try:
                     single_game_card_selector = ".search-result__game .game-rank__game-card"
                     self._log(f'[Plan C] 寻找并点击独立游戏卡片: "{single_game_card_selector}"')
-                    await page.wait_for_selector(single_game_card_selector, timeout=5000)
+                    await page.wait_for_selector(single_game_card_selector, timeout=short_timeout)
                     await page.click(single_game_card_selector)
                     navigation_completed = True
                     self._log("[Plan C] 点击成功！")
@@ -206,9 +209,9 @@ class XiaoheihePlugin(Star):
 
                 self._log("等待标题和数据项出现...")
                 await asyncio.gather(
-                    page.wait_for_selector(title_selector, timeout=10000),
-                    page.wait_for_selector(online_number_selector, timeout=10000),
-                    page.wait_for_selector(online_label_selector, timeout=10000),
+                    page.wait_for_selector(title_selector, timeout=mid_timeout),
+                    page.wait_for_selector(online_number_selector, timeout=mid_timeout),
+                    page.wait_for_selector(online_label_selector, timeout=mid_timeout),
                 )
                 self._log("标题和数据项均已出现，开始提取...")
 
@@ -415,6 +418,7 @@ class XiaoheihePlugin(Star):
                     break
 
             if element:
+                image_bytes = None
                 try:
                     image_bytes = await element.screenshot(
                         type="jpeg", quality=self.image_quality,
@@ -432,6 +436,7 @@ class XiaoheihePlugin(Star):
                             type="jpeg", quality=self.image_quality
                         )
             else:
+                image_bytes = None
                 self._log("未找到任何主要内容区域，进行全页截图")
                 try:
                     image_bytes = await page.screenshot(
@@ -442,6 +447,9 @@ class XiaoheihePlugin(Star):
                     image_bytes = await page.screenshot(
                         type="jpeg", quality=self.image_quality
                     )
+            
+            if not image_bytes:
+                raise RuntimeError("截图过程异常，未能获取到任何图像数据。")
 
             image_path = self._save_temp_image(image_bytes)
             yield event.image_result(image_path)
@@ -485,10 +493,11 @@ class XiaoheihePlugin(Star):
 
     async def terminate(self):
         """插件卸载/停用时调用"""
-        if self._browser and self._browser.is_connected():
-            await self._browser.close()
-            self._log("浏览器已关闭")
-        if self._playwright_manager:
-            await self._playwright_manager.stop()
-            self._log("Playwright 已停止")
+        async with self._browser_lock:
+            if self._browser and self._browser.is_connected():
+                await self._browser.close()
+                self._log("浏览器已关闭")
+            if self._playwright_manager:
+                await self._playwright_manager.stop()
+                self._log("Playwright 已停止")
         logger.info("小黑盒游戏截图插件已停用")
