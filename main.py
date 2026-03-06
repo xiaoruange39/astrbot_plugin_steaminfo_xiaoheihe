@@ -102,7 +102,7 @@ class XiaoheihePlugin(Star):
             yield event.plain_result("请输入要搜索的游戏名称。\n用法：/小黑盒 <游戏名>")
             return
 
-        yield event.plain_result("请求已收到，正在为您生成游戏截图，请稍候... 🎮")
+        yield event.plain_result("请求已收到，正在为您生成游戏截图，请稍候... ")
         self._log(f'收到截图请求，游戏名称: "{game}"')
 
         async with self._semaphore:
@@ -338,7 +338,7 @@ class XiaoheihePlugin(Star):
                     raw_data = raw_data.get("data", raw_data)
 
                 # 尝试做全文正则搜索
-                json_text = json_str if json_str else str(raw_data)
+                json_text = str(raw_data)
                 m = url_pattern.search(json_text)
                 if m:
                     return m.group(0)
@@ -462,7 +462,7 @@ class XiaoheihePlugin(Star):
         """保存临时截图并返回文件路径"""
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(
-            temp_dir, f"xiaoheihe_{id(image_bytes)}_{asyncio.get_event_loop().time()}.jpg"
+            temp_dir, f"xiaoheihe_{id(image_bytes)}_{asyncio.get_running_loop().time()}.jpg"
         )
         with open(file_path, "wb") as f:
             f.write(image_bytes)
@@ -479,7 +479,7 @@ class XiaoheihePlugin(Star):
             except Exception as e:
                 self._log(f"清理临时截图失败 {file_path}: {e}")
         
-        asyncio.get_event_loop().call_later(delay, cleanup)
+        asyncio.get_running_loop().call_later(delay, cleanup)
 
     # ==================== 生命周期 ====================
 
