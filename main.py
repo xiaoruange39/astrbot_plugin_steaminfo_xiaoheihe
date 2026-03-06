@@ -46,6 +46,9 @@ class XiaoheihePlugin(Star):
         # 限制并发截图数量，防止 OOM
         self._semaphore = asyncio.Semaphore(2)
 
+        # 跟踪临时文件以便退出时统一清理
+        self._temp_files = set()
+
     def _log(self, message: str):
         """调试日志"""
         if self.debug:
@@ -77,24 +80,31 @@ class XiaoheihePlugin(Star):
 
         # 注入 Cookie
         if self.cookies:
-            cookie_list = []
-            for pair in self.cookies.split(";"):
-                pair = pair.strip()
-                if not pair:
-                    continue
-                parts = pair.split("=", 1)
-                if len(parts) == 2:
-                    cookie_list.append(
-                        {
-                            "name": parts[0].strip(),
-                            "value": parts[1].strip(),
-                            "domain": ".xiaoheihe.cn",
-                            "path": "/",
-                        }
-                    )
-            if cookie_list:
-                await context.add_cookies(cookie_list)
-                self._log(f"已注入 {len(cookie_list)} 个 Cookie")
+            try:
+                cookie_list = []
+                for pair in self.cookies.split(";"):
+                    pair = pair.strip()
+                    if not pair:
+                        continue
+                    parts = pair.split("=", 1)
+                    if len(parts) == 2:
+                        cookie_list.append(
+                            {
+                                "name": parts[0].strip(),
+                                "value": parts[1].strip(),
+                                "domain": ".xiaoheihe.cn",
+                                "path": "/",
+                            }
+                        )
+                    else:
+                        self._log(f"警告：跳过了格式无效的 Cookie 项 - {pair}")
+                if cookie_list:
+                    await context.add_cookies(cookie_list)
+                    self._log(f"已注入 {len(cookie_list)} 个 Cookie")
+            except Exception as e:
+                self._log(f"注入 Cookie 时发生异常，关闭上下文: {e}")
+                await context.close()
+                raise
 
         return context
 
@@ -414,36 +424,7 @@ class XiaoheihePlugin(Star):
                     self._log(f"找到主要内容区域 ({selector})，进行精准截图")
                     break
 
-            if element:
-                image_bytes = None
-                try:
-                    image_bytes = await element.screenshot(
-                        type="jpeg", quality=self.image_quality,
-                        timeout=self.wait_timeout,
-                    )
-                except Exception as el_err:
-                    self._log(f"元素截图失败 ({found_selector}): {el_err}，回退到全页截图")
-                    try:
-                        image_bytes = await page.screenshot(
-                            full_page=True, type="jpeg", quality=self.image_quality
-                        )
-                    except Exception as fp_err:
-                        self._log(f"全页截图也失败: {fp_err}，回退到视口截图")
-                        image_bytes = await page.screenshot(
-                            type="jpeg", quality=self.image_quality
-                        )
-            else:
-                image_bytes = None
-                self._log("未找到任何主要内容区域，进行全页截图")
-                try:
-                    image_bytes = await page.screenshot(
-                        full_page=True, type="jpeg", quality=self.image_quality
-                    )
-                except Exception as fp_err:
-                    self._log(f"全页截图失败: {fp_err}，回退到视口截图")
-                    image_bytes = await page.screenshot(
-                        type="jpeg", quality=self.image_quality
-                    )
+            image_bytes = await self._take_screenshot_with_fallback(page, element, found_selector)
             
             if not image_bytes:
                 raise RuntimeError("截图过程异常，未能获取到任何图像数据。")
@@ -463,6 +444,33 @@ class XiaoheihePlugin(Star):
 
     # ==================== 工具方法 ====================
 
+    async def _take_screenshot_with_fallback(self, page, element=None, found_selector="") -> bytes:
+        """带降级策略的网页截图"""
+        image_bytes = None
+        
+        if element:
+            try:
+                image_bytes = await element.screenshot(
+                    type="jpeg", quality=self.image_quality, timeout=self.wait_timeout,
+                )
+                return image_bytes
+            except Exception as el_err:
+                self._log(f"元素截图失败 ({found_selector}): {el_err}，回退到全页截图")
+        else:
+            self._log("未找到任何主要内容区域，进行全页截图")
+
+        try:
+            image_bytes = await page.screenshot(
+                full_page=True, type="jpeg", quality=self.image_quality
+            )
+            return image_bytes
+        except Exception as fp_err:
+            reason = "元素截图后全页截图也失败" if element else "全页截图失败"
+            self._log(f"{reason}: {fp_err}，回退到最后手段：视口截图")
+        
+        image_bytes = await page.screenshot(type="jpeg", quality=self.image_quality)
+        return image_bytes
+
     def _save_temp_image(self, image_bytes: bytes) -> str:
         """保存临时截图并返回文件路径"""
         temp_dir = tempfile.gettempdir()
@@ -471,6 +479,7 @@ class XiaoheihePlugin(Star):
         )
         with open(file_path, "wb") as f:
             f.write(image_bytes)
+        self._temp_files.add(file_path)
         self._log(f"临时截图已保存: {file_path}")
         return file_path
 
@@ -480,6 +489,7 @@ class XiaoheihePlugin(Star):
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
+                    self._temp_files.discard(file_path)
                     self._log(f"已清理临时截图: {file_path}")
             except Exception as e:
                 self._log(f"清理临时截图失败 {file_path}: {e}")
@@ -497,4 +507,15 @@ class XiaoheihePlugin(Star):
             if self._playwright_manager:
                 await self._playwright_manager.stop()
                 self._log("Playwright 已停止")
+        
+        # 卸载时彻底清理可能的残留文件
+        for file_path in list(self._temp_files):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    self._log(f"卸载时清理残留截图文件: {file_path}")
+            except Exception:
+                pass
+        self._temp_files.clear()
+
         logger.info("小黑盒游戏截图插件已停用")
