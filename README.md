@@ -1,4 +1,4 @@
-![:name](https://count.getloli.com/@astrbot_plugin_steaminfo_xiaoheihe?name=astrbot_plugin_steaminfo_xiaoheihe&theme=green&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto&prefix=0)
+![:name](https://count.getloli.com/@astrbot_plugin_xiaoheihe?name=astrbot_plugin_xiaoheihe&theme=booru-r6gdrawfriends&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
 # astrbot_plugin_steaminfo_xiaoheihe
 
