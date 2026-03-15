@@ -1,10 +1,4 @@
 {
-    "require_prefix": {
-        "description": "启用指令前缀触发",
-        "type": "bool",
-        "hint": "开启后，必须使用指令前缀（如 /小黑盒）才能触发搜索；关闭后，直接发送“小黑盒 <游戏名>”或“xiaoheihe <游戏名>”亦可无前缀触发。",
-        "default": true
-    },
     "cookies": {
         "description": "小黑盒 Cookie（建议填写）",
         "type": "string",

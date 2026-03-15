@@ -26,7 +26,6 @@ class XiaoheihePlugin(Star):
         self.config = config
 
         # 读取配置
-        self.require_prefix: bool = config.get("require_prefix", True)
         self.cookies: str = config.get("cookies", "")
         self.wait_timeout: int = int(config.get("wait_timeout", 60000))
         self.render_delay: int = int(config.get("render_delay", 5000))
@@ -110,7 +109,7 @@ class XiaoheihePlugin(Star):
 
     # ==================== 指令 ====================
 
-    @filter.command("xiaoheihe", alias={"小黑盒"})
+    @filter.command("xiaoheihe", alias={"小黑盒"}, ignore_prefix=True)
     async def cmd_xiaoheihe(self, event: AstrMessageEvent, game: str = ""):
         """搜索小黑盒游戏并截图"""
         if not game.strip():
@@ -363,17 +362,7 @@ class XiaoheihePlugin(Star):
         """监听所有消息，处理无前缀指令和自动解析小黑盒链接"""
         content = event.message_str or ""
 
-        # 0. 无前缀触发逻辑
-        if not self.require_prefix:
-            content_stripped = content.strip()
-            # 匹配"小黑盒xxx"或"xiaoheihexxx"，允许中间有或者没有空格
-            match = re.match(r'^(?:小黑盒|xiaoheihe)\s*(.*)$', content_stripped, re.IGNORECASE)
-            if match:
-                game = match.group(1).strip()
-                self._log("检测到无前缀触发指令")
-                async for result in self.cmd_xiaoheihe(event, game):
-                    yield result
-                return
+        # 0. 无前缀触发逻辑已移除，由 @filter.command(ignore_prefix=True) 处理
 
         if not self.enable_link_preview:
             return
