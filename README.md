@@ -4,6 +4,8 @@
 
 一个为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的插件，通过小黑盒搜索游戏并截图返回详情页，同时支持自动解析聊天中的小黑盒链接并截图回复。
 
+![Preview](https://picui.ogmua.cn/s1/2026/03/15/69b6c23d59b31.webp) 
+
 ## ✨ 功能
 
 - 🎮 **游戏搜索截图**：通过指令搜索小黑盒上的游戏，自动导航到详情页并返回高清截图
