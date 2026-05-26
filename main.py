@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 import uuid
+import astrbot.api.message_components as Comp
 from urllib.parse import quote
 
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -145,8 +146,11 @@ class XiaoheihePlugin(Star):
                 # 截取当前搜索页作为反馈
                 screenshot_bytes = await page.screenshot(full_page=True)
                 screenshot_path = self._save_temp_image(screenshot_bytes)
-                yield event.plain_result(f"未能找到“{game}”的游戏专题链接。这是当前搜索页面的截图：")
-                yield event.image_result(screenshot_path)
+                chain = [
+                    Comp.Plain(f"未能找到“{game}”的游戏专题链接。这是当前搜索页面的截图："),
+                    Comp.Image.fromFileSystem(screenshot_path)
+                ]
+                yield event.chain_result(chain)
                 self._schedule_cleanup(screenshot_path)
                 return
 
@@ -163,7 +167,7 @@ class XiaoheihePlugin(Star):
             online_info = "获取失败"
             try:
                 title_selector = ".game-name p.name"
-                online_number_selector = ".data-list .data-item:first-child .editor p"
+                online_number_selector = ".data-list .data-item:first-child .editor div"
                 online_label_selector = ".data-list .data-item:first-child > .p2"
 
                 self._log("等待标题和数据项出现...")
@@ -189,7 +193,7 @@ class XiaoheihePlugin(Star):
                 # 尝试获取单位
                 unit = ""
                 online_unit_selector = (
-                    ".data-list .data-item:first-child .editor p + p"
+                    ".data-list .data-item:first-child .editor div + div"
                 )
                 try:
                     unit_el = await page.query_selector(online_unit_selector)
@@ -252,8 +256,12 @@ class XiaoheihePlugin(Star):
                 text_lines.append(online_info)
 
             if text_lines:
-                yield event.plain_result("\n".join(text_lines))
-            yield event.image_result(image_path)
+                result_text = "\n".join(text_lines)
+            chain = [
+                Comp.Plain(result_text),
+                Comp.Image.fromFileSystem(image_path)
+            ]
+            yield event.chain_result(chain)
             self._schedule_cleanup(image_path)
 
         except Exception as e:
