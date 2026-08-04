@@ -5,7 +5,7 @@ import os
 import tempfile
 import uuid
 import astrbot.api.message_components as Comp
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
@@ -42,12 +42,27 @@ class XiaoheihePlugin(Star):
         self._playwright = None
         self._browser: Browser | None = None
         self._browser_lock = asyncio.Lock()
-        
+
         # 限制并发截图数量，防止 OOM
         self._semaphore = asyncio.Semaphore(2)
 
         # 跟踪临时文件以便退出时统一清理
         self._temp_files = set()
+
+        self.game_detail_selectors = [
+            ".game-detail-page-detail",
+            ".game-detail-page",
+            ".game-detail",
+            ".game-page",
+            ".game-topic-detail",
+            ".game-home",
+            "[class*='game-detail']",
+            "[class*='GameDetail']",
+        ]
+        self.page_fallback_selectors = [
+            "main",
+            "#app",
+        ]
 
     def _log(self, message: str):
         """调试日志"""
@@ -127,19 +142,25 @@ class XiaoheihePlugin(Star):
     async def _process_screenshot(self, event: AstrMessageEvent, game: str):
         short_timeout = max(3000, self.wait_timeout // 12)
         mid_timeout = max(5000, self.wait_timeout // 6)
+        target_url = self._extract_url_from_text(game)
 
         context = None
         try:
             context = await self._create_context()
             page = await context.new_page()
 
-            # 搜索游戏
-            search_url = f"https://www.xiaoheihe.cn/app/search?q={quote(game)}"
-            self._log(f"导航到搜索页面: {search_url}")
-            await page.goto(search_url, wait_until="load", timeout=self.wait_timeout)
+            if target_url:
+                self._log(f"检测到直接链接，导航到详情页: {target_url}")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=self.wait_timeout)
+                navigation_success = True
+            else:
+                # 搜索游戏
+                search_url = f"https://www.xiaoheihe.cn/app/search?q={quote(game)}"
+                self._log(f"导航到搜索页面: {search_url}")
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=self.wait_timeout)
 
-            # 多重降级策略寻找并导航到游戏详情页
-            navigation_success = await self._navigate_to_game_page(page, short_timeout, mid_timeout)
+                # 多重降级策略寻找并导航到游戏详情页
+                navigation_success = await self._navigate_to_game_page(page, game, short_timeout, mid_timeout)
 
             if not navigation_success:
                 self._log("所有方案均失败。")
@@ -154,13 +175,18 @@ class XiaoheihePlugin(Star):
                 self._schedule_cleanup(screenshot_path)
                 return
 
-            # 等待核心内容
-            main_content_selector = ".game-detail-page-detail"
-            self._log(f'等待核心内容 "{main_content_selector}" 出现...')
-            await page.wait_for_selector(
-                main_content_selector, timeout=self.wait_timeout
+            # 等待核心内容。小黑盒页面 class 经常变化，不能只依赖旧的
+            # .game-detail-page-detail，否则结构调整后会一直等到超时。
+            main_content_selector = ""
+            detail_timeout = min(self.wait_timeout, max(mid_timeout, 15000))
+            element = await self._find_first_visible_element(
+                page, self.game_detail_selectors, detail_timeout
             )
-            self._log("核心内容容器已出现！")
+            if element:
+                main_content_selector = await self._describe_element(element)
+                self._log(f"核心内容容器已出现: {main_content_selector}")
+            else:
+                self._log("未找到稳定的游戏详情容器，将使用全页截图兜底。")
 
             # 提取游戏标题和在线人数
             extracted_title = game
@@ -235,13 +261,14 @@ class XiaoheihePlugin(Star):
             )
 
             # 精准截图
-            element = await page.query_selector(main_content_selector)
             if not element:
-                raise RuntimeError("无法定位到已等待的核心内容元素")
+                element = await self._find_first_visible_element(
+                    page, self.page_fallback_selectors, 1000
+                )
 
-            self._log("正在执行最终的精准截图...")
-            image_bytes = await element.screenshot(
-                type="jpeg", quality=self.image_quality
+            self._log("正在执行最终截图...")
+            image_bytes = await self._take_screenshot_with_fallback(
+                page, element, main_content_selector
             )
             self._log("截图成功！")
 
@@ -257,6 +284,8 @@ class XiaoheihePlugin(Star):
 
             if text_lines:
                 result_text = "\n".join(text_lines)
+            else:
+                result_text = ""
             chain = [
                 Comp.Plain(result_text),
                 Comp.Image.fromFileSystem(image_path)
@@ -275,7 +304,7 @@ class XiaoheihePlugin(Star):
                 await context.close()
                 self._log("浏览器上下文已关闭。")
 
-    async def _navigate_to_game_page(self, page, short_timeout: int, mid_timeout: int) -> bool:
+    async def _navigate_to_game_page(self, page, game: str, short_timeout: int, mid_timeout: int) -> bool:
         """尝试多种方案导航到游戏详情页"""
         # Plan A: 寻找列表页的游戏链接
         list_game_selector = 'a[href*="/app/topic/game/"]'
@@ -283,7 +312,7 @@ class XiaoheihePlugin(Star):
         try:
             await page.wait_for_selector(list_game_selector, timeout=short_timeout)
             game_page_href = await page.get_attribute(list_game_selector, "href")
-            final_url = f"https://www.xiaoheihe.cn{game_page_href}"
+            final_url = urljoin("https://www.xiaoheihe.cn", game_page_href)
             self._log(f"[Plan A] 成功！获取到链接: {final_url}")
             self._log(f"正在导航到: {final_url}")
             await page.goto(final_url, wait_until="load", timeout=self.wait_timeout)
@@ -320,6 +349,29 @@ class XiaoheihePlugin(Star):
             return True
         except Exception:
             self._log("[Plan C] 失败")
+
+        # Plan D: 新搜索页可能不再使用旧 class，从 DOM 中扫描专题链接
+        self._log("尝试切换到 Plan D...")
+        try:
+            href = await self._find_game_topic_href(page, game)
+            if href:
+                final_url = urljoin("https://www.xiaoheihe.cn", href)
+                self._log(f"[Plan D] 成功！扫描到游戏专题链接: {final_url}")
+                await page.goto(final_url, wait_until="domcontentloaded", timeout=self.wait_timeout)
+                return True
+        except Exception as e:
+            self._log(f"[Plan D] 失败: {e}")
+
+        # Plan E: 如果新版页面把跳转藏在前端事件里，直接点击匹配文本的结果项
+        self._log("尝试切换到 Plan E...")
+        try:
+            clicked = await self._click_game_result_by_text(page, game)
+            if clicked:
+                await page.wait_for_load_state("domcontentloaded", timeout=mid_timeout)
+                self._log(f"[Plan E] 点击搜索结果后当前页面: {page.url}")
+                return True
+        except Exception as e:
+            self._log(f"[Plan E] 失败: {e}")
 
         return False
 
@@ -382,7 +434,7 @@ class XiaoheihePlugin(Star):
         self._log(f"检测到小黑盒链接，开始截图: {target_url}")
 
         yield event.plain_result("检测到小黑盒链接，正在为您生成截图，请稍候...")
-        
+
         async with self._semaphore:
             async for result in self._process_link_screenshot(event, target_url):
                 yield result
@@ -394,35 +446,41 @@ class XiaoheihePlugin(Star):
             page = await context.new_page()
 
             await page.goto(
-                target_url, wait_until="load", timeout=self.wait_timeout
+                target_url, wait_until="domcontentloaded", timeout=self.wait_timeout
             )
 
             # 等待渲染
             await asyncio.sleep(self.render_delay / 1000)
+            await self._prepare_link_page_for_screenshot(page)
 
             # 尝试截取主要内容
+            element = await self._find_article_content_element(page)
+            found_selector = await self._describe_element(element) if element else ""
             candidates = [
                 ".hb-bbs-post",
                 ".hb-bbs-image-text",
-                ".game-detail-page-detail",
+                ".hb-bbs-post-detail",
+                ".article-detail",
+                "article",
+                *self.game_detail_selectors,
                 ".post-detail",
                 ".topic-detail",
-                "main",
-                "#app",
+                *self.page_fallback_selectors,
             ]
 
-            element = None
-            found_selector = ""
-            for selector in candidates:
-                el = await page.query_selector(selector)
-                if el:
-                    element = el
-                    found_selector = selector
-                    self._log(f"找到主要内容区域 ({selector})，进行精准截图")
-                    break
+            if element:
+                self._log(f"通过正文启发式找到主要内容区域 ({found_selector})，进行精准截图")
+            else:
+                for selector in candidates:
+                    el = await page.query_selector(selector)
+                    if el:
+                        element = el
+                        found_selector = selector
+                        self._log(f"找到主要内容区域 ({selector})，进行精准截图")
+                        break
 
             image_bytes = await self._take_screenshot_with_fallback(page, element, found_selector)
-            
+
             if not image_bytes:
                 raise RuntimeError("截图过程异常，未能获取到任何图像数据。")
 
@@ -441,12 +499,230 @@ class XiaoheihePlugin(Star):
 
     # ==================== 工具方法 ====================
 
+    async def _prepare_link_page_for_screenshot(self, page):
+        """隐藏帖子页评论、吸底输入框和浮动操作栏，避免长截图时遮挡正文。"""
+        await page.evaluate(
+            r"""() => {
+                const hide = element => {
+                    if (!element || element.dataset.codexHidden === '1') return;
+                    element.dataset.codexHidden = '1';
+                    element.style.setProperty('display', 'none', 'important');
+                };
+
+                const hideSelectors = [
+                    '[class*="comment" i]',
+                    '[class*="reply" i]',
+                    '[class*="bottom" i][class*="bar" i]',
+                    '[class*="footer" i]',
+                    '[class*="action" i][class*="bar" i]',
+                    '[placeholder*="评论"]',
+                    '[placeholder*="回复"]',
+                ];
+
+                for (const selector of hideSelectors) {
+                    document.querySelectorAll(selector).forEach(node => {
+                        const text = node.innerText || node.textContent || node.getAttribute('placeholder') || '';
+                        const rect = node.getBoundingClientRect();
+                        if (/评论|回复|点赞|分享|收藏/.test(text) || rect.bottom > window.innerHeight * 0.55) {
+                            hide(node.closest('section, footer, form, nav, div') || node);
+                        }
+                    });
+                }
+
+                document.querySelectorAll('body *').forEach(node => {
+                    const style = window.getComputedStyle(node);
+                    if (!['fixed', 'sticky'].includes(style.position)) return;
+
+                    const text = node.innerText || node.textContent || '';
+                    const rect = node.getBoundingClientRect();
+                    const isBottomOverlay = rect.top > window.innerHeight * 0.45;
+                    const isCommentOverlay = /评论|回复|点赞|分享|收藏/.test(text);
+                    const isSmallToolbar = rect.height < 180 && rect.width > window.innerWidth * 0.25;
+
+                    if ((isBottomOverlay && isSmallToolbar) || isCommentOverlay) {
+                        hide(node);
+                    }
+                });
+
+                document.documentElement.style.scrollBehavior = 'auto';
+                window.scrollTo(0, 0);
+            }"""
+        )
+
+    async def _find_article_content_element(self, page):
+        """为帖子链接挑选正文容器，尽量避开评论区和整页根节点。"""
+        handle = await page.evaluate_handle(
+            r"""() => {
+                const badText = /评论|回复|点赞|分享|收藏|去搜索|相关搜索/;
+                const nodes = [...document.querySelectorAll('article, main, section, [class*="post" i], [class*="article" i], [class*="detail" i], [class*="content" i], [class*="bbs" i], div')];
+                let best = null;
+                let bestScore = 0;
+
+                for (const node of nodes) {
+                    if (['HTML', 'BODY', 'SCRIPT', 'STYLE'].includes(node.tagName)) continue;
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width < 260 || rect.height < 220) continue;
+
+                    const style = window.getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+                    const text = (node.innerText || node.textContent || '').trim();
+                    if (text.length < 80) continue;
+
+                    const commentPenalty = badText.test(text) ? 450 : 0;
+                    const rootPenalty = ['app', 'root'].includes(node.id || '') ? 800 : 0;
+                    const navPenalty = node.querySelectorAll('nav, footer, input, textarea').length * 120;
+                    const mediaScore = node.querySelectorAll('img, video').length * 80;
+                    const textScore = Math.min(text.length, 2600);
+                    const score = textScore + mediaScore - commentPenalty - rootPenalty - navPenalty;
+
+                    if (score > bestScore) {
+                        best = node;
+                        bestScore = score;
+                    }
+                }
+
+                return best;
+            }"""
+        )
+        return handle.as_element()
+
+    def _extract_url_from_text(self, text: str) -> str | None:
+        """从指令参数中提取小黑盒链接，支持直接贴专题 URL。"""
+        match = re.search(
+            r"https?://(?:[a-z0-9.-]*\.)?xiaoheihe\.cn[^\s\"'<>]*",
+            text or "",
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return match.group(0).replace("https://xiaoheihe.cn", "https://www.xiaoheihe.cn")
+
+    async def _find_game_topic_href(self, page, game: str) -> str | None:
+        """从新版搜索页扫描游戏专题链接。"""
+        normalized_game = re.sub(r"\s+", "", game or "").lower()
+        candidates = await page.evaluate(
+            r"""() => {
+                const gameHref = /\/app\/topic\/game\//;
+                const nodes = [...document.querySelectorAll('[href], [data-href], [data-url], [onclick]')];
+                const results = [];
+
+                for (const node of nodes) {
+                    const values = [
+                        node.getAttribute('href'),
+                        node.getAttribute('data-href'),
+                        node.getAttribute('data-url'),
+                        node.getAttribute('onclick'),
+                    ].filter(Boolean);
+
+                    for (const value of values) {
+                        const match = String(value).match(/(?:https?:\/\/[^\s'\"]+)?\/app\/topic\/game\/[^\s'\")]+/);
+                        if (!match || !gameHref.test(match[0])) continue;
+                        results.push({
+                            href: match[0],
+                            text: (node.innerText || node.textContent || '').trim(),
+                        });
+                    }
+                }
+
+                const seen = new Set();
+                return results.filter(item => {
+                    if (seen.has(item.href)) return false;
+                    seen.add(item.href);
+                    return true;
+                });
+            }"""
+        )
+
+        if not candidates:
+            self._log("[Plan D] 未扫描到任何游戏专题链接")
+            return None
+
+        for item in candidates:
+            text = re.sub(r"\s+", "", item.get("text") or "").lower()
+            if normalized_game and normalized_game in text:
+                return item.get("href")
+
+        return candidates[0].get("href")
+
+    async def _click_game_result_by_text(self, page, game: str) -> bool:
+        """点击新版搜索页中与游戏名匹配的可见结果。"""
+        normalized_game = re.sub(r"\s+", "", game or "").lower()
+        if not normalized_game:
+            return False
+
+        handle = await page.evaluate_handle(
+            r"""target => {
+                const normalize = value => String(value || '').replace(/\s+/g, '').toLowerCase();
+                const blockedTags = new Set(['HTML', 'BODY', 'SCRIPT', 'STYLE']);
+                const nodes = [...document.querySelectorAll('a, button, [role="button"], [onclick], div, li')];
+
+                for (const node of nodes) {
+                    if (blockedTags.has(node.tagName)) continue;
+                    const text = normalize(node.innerText || node.textContent);
+                    if (!text || !text.includes(target)) continue;
+
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width < 20 || rect.height < 20) continue;
+                    const style = window.getComputedStyle(node);
+                    if (style.visibility === 'hidden' || style.display === 'none') continue;
+
+                    return node.closest('a, button, [role="button"], [onclick]') || node;
+                }
+
+                return null;
+            }""",
+            normalized_game,
+        )
+        element = handle.as_element()
+        if not element:
+            return False
+
+        await element.click(timeout=5000)
+        return True
+
+    async def _find_first_visible_element(self, page, selectors: list[str], timeout: int = 0):
+        """按候选选择器查找首个可见元素，适配小黑盒频繁变更的 class。"""
+        deadline = timeout / 1000
+        start = asyncio.get_running_loop().time()
+
+        while True:
+            for selector in selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        box = await element.bounding_box()
+                        if box and box.get("width", 0) > 20 and box.get("height", 0) > 20:
+                            return element
+                except Exception as e:
+                    self._log(f"检查候选容器 {selector} 时失败: {e}")
+
+            if timeout <= 0 or asyncio.get_running_loop().time() - start >= deadline:
+                return None
+            await asyncio.sleep(0.5)
+
+    async def _describe_element(self, element) -> str:
+        """生成用于日志的元素描述。"""
+        try:
+            return await element.evaluate(
+                """el => {
+                    const id = el.id ? `#${el.id}` : '';
+                    const classes = typeof el.className === 'string'
+                        ? el.className.trim().split(/\\s+/).filter(Boolean).map(c => `.${c}`).join('')
+                        : '';
+                    return `${el.tagName.toLowerCase()}${id}${classes}`;
+                }"""
+            )
+        except Exception:
+            return "unknown element"
+
     async def _take_screenshot_with_fallback(self, page, element=None, found_selector="") -> bytes:
         """带降级策略的网页截图"""
         image_bytes = None
-        
+
         if element:
             try:
+                await element.scroll_into_view_if_needed(timeout=5000)
                 image_bytes = await element.screenshot(
                     type="jpeg", quality=self.image_quality, timeout=self.wait_timeout,
                 )
@@ -464,7 +740,7 @@ class XiaoheihePlugin(Star):
         except Exception as fp_err:
             reason = "元素截图后全页截图也失败" if element else "全页截图失败"
             self._log(f"{reason}: {fp_err}，回退到最后手段：视口截图")
-        
+
         image_bytes = await page.screenshot(type="jpeg", quality=self.image_quality)
         return image_bytes
 
@@ -490,7 +766,7 @@ class XiaoheihePlugin(Star):
                     self._log(f"已清理临时截图: {file_path}")
             except Exception as e:
                 self._log(f"清理临时截图失败 {file_path}: {e}")
-        
+
         asyncio.get_running_loop().call_later(delay, cleanup)
 
     # ==================== 生命周期 ====================
@@ -501,10 +777,15 @@ class XiaoheihePlugin(Star):
             if self._browser and self._browser.is_connected():
                 await self._browser.close()
                 self._log("浏览器已关闭")
-            if self._playwright_manager:
-                await self._playwright_manager.stop()
+
+            if self._playwright:
+                await self._playwright.stop()
                 self._log("Playwright 已停止")
-        
+
+            self._browser = None
+            self._playwright = None
+            self._playwright_manager = None
+
         # 卸载时彻底清理可能的残留文件
         for file_path in list(self._temp_files):
             try:
