@@ -8,6 +8,7 @@ import sys
 import time
 import hashlib
 import secrets
+import html
 import astrbot.api.message_components as Comp
 from urllib.parse import quote, urljoin
 
@@ -39,7 +40,7 @@ class XiaoheihePlugin(Star):
         self.show_game_title: bool = config.get("show_game_title", True)
         self.show_online_count: bool = config.get("show_online_count", True)
         self.enable_link_preview: bool = config.get("enable_link_preview", True)
-        self.link_text_parse: bool = False
+        self.link_text_parse: bool = config.get("link_text_parse", False)
         self.link_text_include_images: bool = config.get("link_text_include_images", True)
         self.link_text_fallback_screenshot: bool = config.get("link_text_fallback_screenshot", False)
         self.debug: bool = config.get("debug", False)
@@ -474,6 +475,8 @@ class XiaoheihePlugin(Star):
 
     def _extract_xiaoheihe_url(self, event: AstrMessageEvent) -> str | None:
         """从消息中提取小黑盒链接，支持纯文本和 QQ JSON 卡片消息"""
+        from urllib.parse import unquote
+
         url_pattern = re.compile(
             r"https?://(?:[a-z0-9.-]*\.)?xiaoheihe\.cn[^\s\"'<>]*", re.IGNORECASE
         )
@@ -489,24 +492,18 @@ class XiaoheihePlugin(Star):
             message_chain = getattr(event.message_obj, "message", None) or []
             for seg in message_chain:
                 seg_type = getattr(seg, "type", None) or ""
-                # OneBot JSON 消息段的 type 为 "json"
-                if seg_type.lower() != "json":
+                if seg_type and seg_type.lower() not in {"json", "xml", "text", "card"}:
                     continue
 
-                # 提取 data 字段（可能是字符串或 dict）
                 raw_data = getattr(seg, "data", None)
                 if raw_data is None:
                     continue
 
-                # 如果 data 本身是 dict，取其内部的 "data" 字段（OneBot 嵌套结构）
-                if isinstance(raw_data, dict):
-                    raw_data = raw_data.get("data", raw_data)
-
-                # 尝试做全文正则搜索
-                json_text = json.dumps(raw_data, ensure_ascii=False) if isinstance(raw_data, (dict, list)) else str(raw_data)
-                m = url_pattern.search(json_text)
-                if m:
-                    return m.group(0)
+                for candidate in self._iter_url_text_candidates(raw_data):
+                    for text in (candidate, unquote(candidate)):
+                        m = url_pattern.search(text)
+                        if m:
+                            return m.group(0)
         except Exception as e:
             self._log(f"解析 JSON 卡片消息时出错: {e}")
 
@@ -598,9 +595,14 @@ class XiaoheihePlugin(Star):
                 self._log("链接解析：浏览器上下文已关闭")
 
     async def _process_link_text(self, event: AstrMessageEvent, target_url: str):
-        """直接调用小黑盒 API 解析帖子正文，以单条合并转发消息发送。"""
+        """直接调用小黑盒 API 解析链接内容，以合并转发方式发送图文。"""
         try:
             parsed = self._parse_link_url(target_url)
+            if not parsed:
+                resolved_url = await self._resolve_xiaoheihe_url(target_url)
+                if resolved_url and resolved_url != target_url:
+                    self._log(f"链接重定向后解析: {resolved_url}")
+                    parsed = self._parse_link_url(resolved_url)
             if not parsed:
                 self._log(f"无法从链接中提取 link_id: {target_url}")
                 if self.link_text_fallback_screenshot:
@@ -618,6 +620,16 @@ class XiaoheihePlugin(Star):
                 content = self._parse_bbs_content(payload, target_url)
             else:
                 content = self._parse_game_content(payload, target_url)
+            if link_type == "bbs":
+                cover_url = self._extract_img_url(
+                    payload.get("result", {}).get("link", {}).get("thumb")
+                    or payload.get("result", {}).get("link", {}).get("video_thumb")
+                )
+                if cover_url:
+                    cover_bytes = await self._download_image(cover_url)
+                    if cover_bytes:
+                        content["cover_bytes"] = cover_bytes
+            content["blocks"] = self._dedupe_link_blocks(content.get("blocks") or [])
             blocks = content.get("blocks") or []
 
             for block in blocks:
@@ -633,6 +645,13 @@ class XiaoheihePlugin(Star):
             ) or any(content.get(key) for key in ("title", "author", "publish_time"))
             if not has_content:
                 self._log("API 未解析到正文内容。")
+                fallback_content = await self._fallback_parse_xiaoheihe_page(target_url)
+                if fallback_content:
+                    nodes = self._build_link_forward_nodes(fallback_content, self._get_forward_uin(event))
+                    if nodes:
+                        yield event.chain_result(nodes)
+                        self._log("链接解析（网页兜底合并转发）完成")
+                        return
                 if self.link_text_fallback_screenshot:
                     async for result in self._process_link_screenshot(event, target_url):
                         yield result
@@ -640,14 +659,17 @@ class XiaoheihePlugin(Star):
                     yield event.plain_result("未能解析到正文内容，已按文字模式跳过截图。")
                 return
 
-            uin = self._get_forward_uin(event)
-            node = self._build_forward_node(content, target_url, uin)
-            if not node:
-                yield event.plain_result("未能解析到任何内容，请稍后再试。")
-                return
+            nodes = self._build_link_forward_nodes(content, self._get_forward_uin(event))
+            if not nodes:
+                fallback_content = await self._fallback_parse_xiaoheihe_page(target_url)
+                if fallback_content:
+                    nodes = self._build_link_forward_nodes(fallback_content, self._get_forward_uin(event))
+                if not nodes:
+                    yield event.plain_result("未能解析到任何内容，请稍后再试。")
+                    return
 
-            yield event.chain_result([node])
-            self._log("链接解析（API 文字合并转发）完成")
+            yield event.chain_result(nodes)
+            self._log("链接解析（API 合并转发）完成")
 
         except Exception as e:
             logger.error(f"链接文字解析失败: {e}")
@@ -670,32 +692,138 @@ class XiaoheihePlugin(Star):
                 return ("pc", topic_match.group(1))
 
             for game_type, keys in {
-                "pc": ("steam_appid", "steam_app_id", "steamid"),
-                "console": ("console_appid", "console_id"),
-                "mobile": ("mobile_appid", "mobile_id"),
+                "pc": ("steam_appid", "steam_app_id", "steamappid", "steamid", "appid", "gameid", "game_id"),
+                "console": ("console_appid", "console_id", "appid", "gameid", "game_id"),
+                "mobile": ("mobile_appid", "mobile_id", "appid", "gameid", "game_id"),
             }.items():
                 for key in keys:
                     value = str(query.get(key, "")).strip()
                     if value.isdigit():
                         return (game_type, value)
 
-            for key in ("link_id", "linkid", "id", "post_id"):
+            for key in ("link_id", "linkid", "id", "post_id", "postid", "content_id", "contentid", "article_id", "articleid", "share_id", "shareid", "topic_id", "topicid", "bbs_id"):
                 value = str(query.get(key, "")).strip()
-                if value.isdigit():
+                if self._is_link_id(value):
                     return ("bbs", value)
 
             segments = [s for s in path.split("/") if s]
             for seg in reversed(segments):
                 clean = seg.split("?")[0].split("#")[0]
-                if clean.isdigit():
+                if self._is_link_id(clean):
                     return ("bbs", clean)
 
-            m = re.search(r"/(\d{4,})(?:/|$|\?)", url)
+            m = re.search(r"/([A-Za-z0-9_-]{6,})(?:/|$|\?)", url)
             if m:
                 return ("bbs", m.group(1))
         except Exception as e:
             self._log(f"解析链接 id 失败: {e}")
         return None
+
+    def _is_link_id(self, value: str) -> bool:
+        """小黑盒分享 API 的 link_id 可能是数字，也可能是字母数字混合。"""
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{6,}", str(value or "").strip()))
+
+    async def _fallback_parse_xiaoheihe_page(self, target_url: str) -> dict | None:
+        """当分享 API 没有正文时，直接从网页中提取可读正文作为兜底。"""
+        context = None
+        try:
+            context = await self._create_context()
+            page = await context.new_page()
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=self.wait_timeout)
+            await asyncio.sleep(self.render_delay / 1000)
+
+            page_html = await page.content()
+            for candidate in self._iter_url_text_candidates(page_html):
+                parsed = self._parse_link_url(candidate)
+                if not parsed:
+                    continue
+                link_type, link_id = parsed
+                if link_type != "bbs":
+                    continue
+                original = self._parse_link_url(target_url)
+                if original and original == parsed:
+                    continue
+                try:
+                    payload = await self._fetch_link_api(link_type, link_id)
+                    content = self._parse_bbs_content(payload, candidate)
+                    content["blocks"] = self._dedupe_link_blocks(content.get("blocks") or [])
+                    if any(
+                        block.get("type") == "text" and block.get("text")
+                        for block in content.get("blocks") or []
+                        if isinstance(block, dict)
+                    ):
+                        for block in content.get("blocks") or []:
+                            if self.link_text_include_images and block.get("type") == "image":
+                                img_bytes = await self._download_image(block.get("url"))
+                                if img_bytes:
+                                    block["image_bytes"] = img_bytes
+                        return content
+                except Exception as e:
+                    self._log(f"网页中真实 link_id 二次解析失败: {e}")
+
+            extracted = await page.evaluate(
+                r"""() => {
+                    const pick = selectors => {
+                        for (const selector of selectors) {
+                            const node = document.querySelector(selector);
+                            if (node) return node;
+                        }
+                        return null;
+                    };
+
+                    const root = pick([
+                        'article',
+                        'main',
+                        '[class*="post-detail" i]',
+                        '[class*="bbs" i]',
+                        '[class*="content" i]',
+                        '[class*="article" i]',
+                    ]) || document.body;
+
+                    const text = (root.innerText || root.textContent || '').trim();
+                    const imageUrls = [...root.querySelectorAll('img')]
+                        .map(img => img.getAttribute('data-original') || img.currentSrc || img.src || img.getAttribute('src'))
+                        .filter(Boolean)
+                        .filter(url => !/avatar|icon|logo|emoji|sprite/i.test(url))
+                        .slice(0, 12);
+                    return { text, imageUrls };
+                }"""
+            )
+
+            text = self._clean_html(str((extracted or {}).get("text") or ""))
+            if not text:
+                return None
+
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                return None
+
+            title = lines[0]
+            body_lines = lines[1:]
+            blocks = []
+            if body_lines:
+                blocks.append({"type": "text", "text": "\n\n".join(body_lines[:20])})
+
+            for url in (extracted or {}).get("imageUrls") or []:
+                image_url = self._extract_img_url(url)
+                if not image_url:
+                    continue
+                image_bytes = await self._download_image(image_url)
+                if image_bytes:
+                    blocks.append({"type": "image", "url": image_url, "image_bytes": image_bytes})
+
+            return {
+                "title": title,
+                "author": "",
+                "publish_time": "",
+                "blocks": blocks,
+            }
+        except Exception as e:
+            self._log(f"网页兜底解析失败: {e}")
+            return None
+        finally:
+            if context:
+                await context.close()
 
     async def _fetch_link_api(self, link_type: str, link_id: str) -> dict:
         """调用小黑盒 API 获取帖子正文数据（复用本地签名模块）。"""
@@ -714,10 +842,10 @@ class XiaoheihePlugin(Star):
         import aiohttp
 
         path_map = {
-            "bbs": "/bbs/app/link/tree/",
-            "pc": "/game/get_game_detail/",
-            "console": "/game/console/get_game_detail/",
-            "mobile": "/game/mobile/get_game_detail/",
+            "bbs": "/bbs/app/link/tree",
+            "pc": "/game/get_game_detail",
+            "console": "/game/console/get_game_detail",
+            "mobile": "/game/mobile/get_game_detail",
         }
         api_path = path_map.get(link_type, path_map["bbs"])
 
@@ -813,6 +941,20 @@ class XiaoheihePlugin(Star):
             except Exception:
                 result["publish_time"] = str(ts)
 
+        summary_text = (
+            post.get("description")
+            or post.get("summary")
+            or post.get("share_desc")
+            or body.get("description")
+            or body.get("summary")
+            or ""
+        )
+        summary_text = self._clean_html(summary_text) if isinstance(summary_text, str) else ""
+
+        text_content = post.get("content") or post.get("text") or post.get("description") or ""
+        if isinstance(text_content, str) and text_content.strip():
+            self._collect_link_text_blocks(text_content, result)
+
         content_list = (
             post.get("content_list")
             or post.get("content")
@@ -840,6 +982,13 @@ class XiaoheihePlugin(Star):
             if text.strip():
                 result["blocks"].append({"type": "text", "text": text})
 
+        has_text_block = any(
+            isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip()
+            for block in result["blocks"]
+        )
+        if not has_text_block and summary_text and summary_text != result["title"]:
+            result["blocks"].insert(0, {"type": "text", "text": summary_text})
+
         if not any(b.get("type") == "image" for b in result["blocks"]):
             img_list = post.get("imgs") or post.get("pictures") or []
             if isinstance(img_list, list):
@@ -849,6 +998,157 @@ class XiaoheihePlugin(Star):
                         result["blocks"].append({"type": "image", "url": url})
 
         return result
+
+    def _collect_link_text_blocks(self, text_content: str, result: dict):
+        """解析小黑盒 link.text 里的 JSON 图文数组。"""
+        try:
+            parsed = json.loads(text_content)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").lower()
+                if item_type in {"text", "txt"}:
+                    text = self._clean_html(str(item.get("text") or item.get("content") or ""))
+                    if text.strip():
+                        result["blocks"].append({"type": "text", "text": text})
+                    continue
+                if item_type in {"img", "image", "pic", "picture"}:
+                    url = self._extract_img_url(item.get("url") or item.get("src") or item)
+                    if url:
+                        result["blocks"].append({"type": "image", "url": url})
+                    continue
+                if item_type == "html":
+                    html_text = str(item.get("text") or item.get("content") or "")
+                    if html_text.strip():
+                        self._collect_xhh_html_blocks(html_text, result["blocks"])
+                    continue
+                if item_type in {"game_card", "gamecard"}:
+                    appid = str(item.get("appid") or item.get("steam_appid") or item.get("gameid") or "").strip()
+                    if appid:
+                        result["blocks"].append({"type": "game_card", "appid": appid})
+                    continue
+
+        elif isinstance(parsed, dict):
+            self._collect_content_blocks(parsed, result["blocks"])
+        else:
+            text = self._clean_html(str(text_content))
+            if text.strip():
+                result["blocks"].append({"type": "text", "text": text})
+
+    def _collect_xhh_html_blocks(self, html_text: str, blocks: list):
+        """参考 rconsole-plugin 的方式解析小黑盒 html 图文混排正文。"""
+        parts = re.split(r"(<img\b[^>]*?/?>|<iframe\b.*?</iframe>)", html_text, flags=re.IGNORECASE | re.DOTALL)
+        text_buffer = []
+
+        def flush_text():
+            if not text_buffer:
+                return
+            text = self._clean_xhh_html_text("".join(text_buffer))
+            text_buffer.clear()
+            if text:
+                blocks.append({"type": "text", "text": text})
+
+        for part in parts:
+            if not part:
+                continue
+            lower = part.lower()
+            if lower.startswith("<img"):
+                flush_text()
+                game_match = re.search(r'data-gameid=["\']?(\d+)', part, flags=re.IGNORECASE)
+                if game_match:
+                    blocks.append({"type": "game_card", "appid": game_match.group(1)})
+                    continue
+                img_match = re.search(
+                    r'(?:data-original|origin|src|url)=["\']([^"\']+)',
+                    part,
+                    flags=re.IGNORECASE,
+                )
+                if img_match:
+                    url = self._extract_img_url(html.unescape(img_match.group(1)).replace("\\/", "/"))
+                    if url:
+                        blocks.append({"type": "image", "url": url})
+                    continue
+                text_buffer.append(part)
+                continue
+            if lower.startswith("<iframe"):
+                flush_text()
+                src_match = re.search(r'src=["\']([^"\']+)', part, flags=re.IGNORECASE)
+                if src_match:
+                    src = html.unescape(src_match.group(1)).replace("\\/", "/").replace("\\", "")
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    if src:
+                        blocks.append({"type": "text", "text": f"({src})"})
+                continue
+            text_buffer.append(part)
+
+        flush_text()
+
+    def _is_redundant_summary_text(self, summary_text: str, blocks: list) -> bool:
+        """判断摘要是否已经被正文首段覆盖，避免在顶部重复显示。"""
+        summary_norm = re.sub(r"\s+", " ", self._clean_html(summary_text)).strip()
+        if not summary_norm:
+            return True
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "text":
+                continue
+            text_norm = re.sub(r"\s+", " ", self._clean_html(str(block.get("text") or ""))).strip()
+            if not text_norm:
+                continue
+            if summary_norm == text_norm:
+                return True
+            if summary_norm in text_norm and len(text_norm) - len(summary_norm) <= 40:
+                return True
+            if text_norm.startswith(summary_norm) and len(summary_norm) >= 16:
+                return True
+            if summary_norm.startswith(text_norm) and len(text_norm) >= 16:
+                return True
+
+        return False
+
+    def _clean_xhh_html_text(self, text: str) -> str:
+        """清理小黑盒正文 HTML，保留链接可读信息与段落换行。"""
+        if not text:
+            return ""
+
+        def replace_link(match):
+            href = html.unescape(match.group(1)).replace("\\/", "/").replace("\\", "")
+            label = self._clean_html(match.group(2))
+            if not label:
+                return ""
+            formatted = f"『{label}』"
+            try:
+                decoded = html.unescape(href)
+                protocol_match = re.search(r"heybox://(\{.*\})", decoded)
+                if protocol_match:
+                    link_data = json.loads(protocol_match.group(1))
+                    protocol_type = link_data.get("protocol_type")
+                    if protocol_type == "openUser" and link_data.get("user_id"):
+                        return f"{formatted} (https://www.xiaoheihe.cn/app/user/profile/{link_data['user_id']})"
+                    if protocol_type == "openGameDetail" and link_data.get("app_id"):
+                        game_type = link_data.get("game_type") or "pc"
+                        return f"{formatted} (https://www.xiaoheihe.cn/app/topic/game/{game_type}/{link_data['app_id']})"
+                    link = link_data.get("link") or {}
+                    if protocol_type == "openLink" and link.get("linkid"):
+                        return f"{formatted} (https://www.xiaoheihe.cn/app/bbs/link/{link['linkid']})"
+            except Exception:
+                return formatted
+            if href.startswith("http"):
+                return f"{formatted} ({href})"
+            return formatted
+
+        text = re.sub(r'<a[^>]*?href=["\']([^"\']*)["\'][^>]*?>(.*?)</a>', replace_link, text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'<span[^>]*?data-emoji=["\']([^"\']*)["\'][^>]*?>.*?</span>', lambda m: f"[{m.group(1)}]", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"</p>|</h[1-6]>|</blockquote>|<br\s*/?>", "\n\n", text, flags=re.IGNORECASE)
+        text = self._clean_html(text)
+        return text.strip()
 
     def _parse_game_content(self, payload: dict, source_url: str) -> dict:
         """从游戏详情 API 响应中提取可读的文字与媒体。"""
@@ -1105,47 +1405,143 @@ class XiaoheihePlugin(Star):
                     cookies[kv[0].strip()] = kv[1].strip()
         return cookies
 
-    def _build_forward_node(self, content: dict, source_url: str, uin: str):
-        """将解析结果按原文顺序组装为单条合并转发节点。"""
+    def _dedupe_link_blocks(self, blocks: list) -> list:
+        """去掉 API 中 description 与 text 首段重复造成的重复正文。"""
+        deduped = []
+        seen_text = set()
+        seen_images = set()
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text = self._clean_html(str(block.get("text") or ""))
+                key = re.sub(r"\s+", " ", text).strip()
+                if not key or key in seen_text:
+                    continue
+                seen_text.add(key)
+                item = dict(block)
+                item["text"] = text
+                deduped.append(item)
+                continue
+            if block_type == "image":
+                url = str(block.get("url") or "").strip()
+                if not url or url in seen_images:
+                    continue
+                seen_images.add(url)
+                deduped.append(block)
+                continue
+            deduped.append(block)
+        return deduped
+
+    def _build_link_forward_nodes(self, content: dict, uin: str):
+        """将解析结果按原文顺序组装为一个合并转发中的多条记录节点。"""
+        components = []
         nickname = "小黑盒解析"
+
+        pending_text = []
+
+        cover_bytes = content.get("cover_bytes")
+        if cover_bytes:
+            try:
+                components.append(Comp.Image.fromBytes(cover_bytes))
+            except Exception as e:
+                self._log(f"构造封面图片失败: {e}")
 
         header_lines = []
         if content.get("title"):
-            header_lines.append(content["title"])
+            header_lines.append(str(content["title"]).strip())
         meta_parts = []
         if content.get("author"):
-            meta_parts.append(content["author"])
+            meta_parts.append(str(content["author"]).strip())
         if content.get("publish_time"):
-            meta_parts.append(content["publish_time"])
+            meta_parts.append(str(content["publish_time"]).strip())
         if meta_parts:
             header_lines.append(" · ".join(meta_parts))
-        header_lines.append(f"来源：{source_url}")
 
-        components = []
-        text_buf = "\n".join(header_lines)
+        if header_lines:
+            components.append(Comp.Plain("\n\n".join(header_lines).strip()))
+
+        def flush_text_node():
+            nonlocal pending_text
+            if pending_text:
+                components.append(Comp.Plain("\n\n".join(pending_text).strip()))
+                pending_text = []
 
         for block in content.get("blocks") or []:
             if block.get("type") == "text" and block.get("text"):
-                if text_buf:
-                    text_buf += "\n\n" + block["text"]
-                else:
-                    text_buf = block["text"]
-            elif self.link_text_include_images and block.get("type") == "image" and block.get("image_bytes"):
-                if text_buf:
-                    components.append(Comp.Plain(text_buf))
-                    text_buf = ""
+                text = self._clean_html(str(block["text"]))
+                if text:
+                    pending_text.append(text)
+                continue
+
+            if block.get("type") == "image" and block.get("image_bytes"):
+                flush_text_node()
                 try:
                     components.append(Comp.Image.fromBytes(block["image_bytes"]))
                 except Exception as e:
-                    self._log(f"构造图片组件失败: {e}")
+                    self._log(f"构造图片节点失败: {e}")
+                continue
 
-        if text_buf:
-            components.append(Comp.Plain(text_buf))
+            if block.get("type") == "game_card":
+                appid = str(block.get("appid") or "").strip()
+                if appid:
+                    flush_text_node()
+                    components.append(Comp.Plain(f"相关游戏：{appid}"))
 
+        flush_text_node()
         if not components:
-            return None
+            return []
+        return [Comp.Node(components, uin=uin, name=nickname)]
 
-        return Comp.Node(components, uin=uin, name=nickname)
+    def _iter_url_text_candidates(self, value):
+        """递归展开消息载荷中的所有字符串候选，尽量找出被转义或嵌套的 URL。"""
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from self._iter_url_text_candidates(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from self._iter_url_text_candidates(item)
+            return
+
+        text = str(value)
+        if not text:
+            return
+
+        yield text
+
+        normalized = self._normalize_url_text(text)
+        if normalized and normalized != text:
+            yield normalized
+
+        if text[:1] in "[{":
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                yield from self._iter_url_text_candidates(parsed)
+
+    def _normalize_url_text(self, text: str) -> str:
+        """对 QQ 卡片里常见的转义形式做轻量反解，避免 URL 被转义层层包住。"""
+        if not text:
+            return ""
+
+        text = html.unescape(text)
+        text = text.replace("\\/", "/")
+        text = text.replace(r"\/", "/")
+        text = text.replace("\\u002F", "/").replace("\u002F", "/")
+        text = text.replace("\\u003A", ":").replace("\u003A", ":")
+        text = text.replace("\\u0026", "&").replace("\u0026", "&")
+        text = text.replace("\\u003F", "?").replace("\u003F", "?")
+        text = text.replace("\\u003D", "=").replace("\u003D", "=")
+        text = text.replace("\\u0023", "#").replace("\u0023", "#")
+        text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+        return text
+
     def _get_forward_uin(self, event: AstrMessageEvent) -> str:
         """获取用于合并转发节点的发送者 ID。"""
         try:

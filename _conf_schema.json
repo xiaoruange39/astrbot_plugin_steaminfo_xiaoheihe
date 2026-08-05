@@ -50,8 +50,14 @@
    "enable_link_preview": {
        "description": "自动解析小黑盒链接",
        "type": "bool",
-       "hint": "启用后，当用户发送小黑盒链接时，插件会自动解析该链接并使用截图回复。",
+       "hint": "启用后，当用户发送小黑盒链接时，插件会自动解析该链接。默认使用截图回复；开启「文字模式」后改为文字模式。",
        "default": true
+   },
+   "link_text_parse": {
+       "description": "文字模式",
+       "type": "bool",
+       "hint": "启用后，自动解析小黑盒链接时不再截图，而是提取正文文字与图片，并按原文顺序放入文字模式中。",
+       "default": false
    },
    "debug": {
         "description": "调试模式",

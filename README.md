@@ -62,6 +62,8 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 
 当启用 `enable_link_preview` 配置后，插件会自动监听聊天中的小黑盒链接并截图回复。
 
+如果同时启用了 `link_text_parse`，链接解析将改为「文字模式」：插件会提取正文文字与图片，并按原文顺序发送。
+
 支持的链接格式：
 - 纯文本链接：直接发送 `https://www.xiaoheihe.cn/...` 即可触发
 - **QQ JSON 卡片分享**：通过 QQ 分享的小黑盒卡片消息也能自动识别
@@ -94,6 +96,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 | `show_game_title` | bool | `true` | 截图回复时是否显示游戏名称 |
 | `show_online_count` | bool | `true` | 截图回复时是否显示在线人数 |
 | `enable_link_preview` | bool | `true` | 是否自动解析小黑盒链接并截图 |
+| `link_text_parse` | bool | `false` | 启用后，链接解析改为文字模式 |
 
 ### 调试
 
