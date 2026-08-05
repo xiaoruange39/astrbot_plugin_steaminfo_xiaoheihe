@@ -1,4 +1,4 @@
-![:name](https://count.getloli.com/@astrbot_plugin_xiaoheihe?name=astrbot_plugin_xiaoheihe&theme=booru-r6gdrawfriends&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+﻿![:name](https://count.getloli.com/@astrbot_plugin_xiaoheihe?name=astrbot_plugin_xiaoheihe&theme=booru-r6gdrawfriends&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
 # astrbot_plugin_steaminfo_xiaoheihe
 
@@ -12,6 +12,7 @@
 - 📊 **游戏信息提取**：自动提取游戏标题和在线人数等信息，以文本形式一并返回
 - 🔗 **链接自动解析**：监听聊天消息，自动识别小黑盒链接并截图回复（支持 QQ JSON 卡片消息）
 - 🍪 **Cookie 支持**：配置 Cookie 后可正常搜索并访问需要登录才能查看的内容
+- 📱 **扫码登录**：支持通过小黑盒 App 扫码直接登录，无需手动获取 Cookie
 
 ## 🚀 安装
 
@@ -44,6 +45,9 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 |------|------|
 | `/小黑盒 <游戏名>` | 搜索游戏并返回详情页截图 |
 | `/xiaoheihe <游戏名>` | 同上（英文别名） |
+| `/小黑盒扫码登录` | 生成二维码，用小黑盒 App 扫码完成登录 |
+| `/小黑盒退出登录` | 清除已保存的扫码登录凭证 |
+| `/小黑盒登录状态` | 查看当前登录状态 |
 
 **示例：**
 
@@ -72,6 +76,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 |--------|------|--------|------|
 | `require_prefix` | bool | `true` | 启用指令前缀触发。关闭后发送“小黑盒 游戏名”亦可即刻触发 |
 | `cookies` | string | `""` | 小黑盒 Cookie（建议填写） |
+| `login_timeout` | int | `120` | 扫码登录等待超时（秒），超时后需重新发起 |
 
 ### 截图设置
 
@@ -100,6 +105,14 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 
 ## 🍪 如何获取小黑盒 Cookie？
 
+### 方式一：扫码登录（推荐）
+
+直接在聊天中发送 `/小黑盒扫码登录`，插件会生成一张二维码图片。用小黑盒 App 扫码并确认后，插件会自动保存登录凭证，后续截图无需手动配置 Cookie。
+
+扫码登录的凭证会保存在插件目录下的 `credentials.json` 中，重启后依然有效。如需切换账号，先发送 `/小黑盒退出登录`，再重新 `/小黑盒扫码登录` 即可。
+
+### 方式二：手动获取 Cookie
+
 1. 在浏览器（推荐 Chrome / Edge）中访问并登录 [小黑盒官网](https://www.xiaoheihe.cn/)
 2. 登录成功后，按 `F12` 打开开发者工具
 3. 切换到 **网络**（Network）面板
@@ -120,6 +133,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 ## 🙏 致谢
 
 本插件基于 [WhiteBr1ck/koishi-plugin-steaminfo-xiaoheihe](https://github.com/WhiteBr1ck/koishi-plugin-steaminfo-xiaoheihe#readme) 移植而来，感谢原作者的创意和设计。
+扫码登录的实现参考了 [674537331/astrbot_plugin_xiaoheihe_adapter](https://github.com/674537331/astrbot_plugin_xiaoheihe_adapter)，感谢其完整的 API 签名与登录流程设计。
 
 ## ⚠️ 免责声明
 

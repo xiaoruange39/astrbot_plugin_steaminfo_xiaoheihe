@@ -1,1 +1,4 @@
 playwright
+aiohttp
+qrcode
+pillow

@@ -4,6 +4,10 @@ import asyncio
 import os
 import tempfile
 import uuid
+import sys
+import time
+import hashlib
+import secrets
 import astrbot.api.message_components as Comp
 from urllib.parse import quote, urljoin
 
@@ -35,6 +39,9 @@ class XiaoheihePlugin(Star):
         self.show_game_title: bool = config.get("show_game_title", True)
         self.show_online_count: bool = config.get("show_online_count", True)
         self.enable_link_preview: bool = config.get("enable_link_preview", True)
+        self.link_text_parse: bool = False
+        self.link_text_include_images: bool = config.get("link_text_include_images", True)
+        self.link_text_fallback_screenshot: bool = config.get("link_text_fallback_screenshot", False)
         self.debug: bool = config.get("debug", False)
 
         # Playwright 实例（延迟初始化）
@@ -42,12 +49,24 @@ class XiaoheihePlugin(Star):
         self._playwright = None
         self._browser: Browser | None = None
         self._browser_lock = asyncio.Lock()
-
+        
         # 限制并发截图数量，防止 OOM
         self._semaphore = asyncio.Semaphore(2)
 
         # 跟踪临时文件以便退出时统一清理
         self._temp_files = set()
+
+        # 扫码登录状态
+        self._credentials_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "credentials.json"
+        )
+        self._login_cookies: dict[str, str] = {}
+        self._login_uid: str = ""
+        self._login_nickname: str = ""
+        self._login_device_id: str = ""
+        self._login_poll_interval: int = 3
+        self.login_timeout: int = int(config.get("login_timeout", 120))
+        self._load_credentials()
 
         self.game_detail_selectors = [
             ".game-detail-page-detail",
@@ -94,28 +113,11 @@ class XiaoheihePlugin(Star):
         )
 
         # 注入 Cookie
-        if self.cookies:
+        cookie_list = self._build_cookie_list()
+        if cookie_list:
             try:
-                cookie_list = []
-                for pair in self.cookies.split(";"):
-                    pair = pair.strip()
-                    if not pair:
-                        continue
-                    parts = pair.split("=", 1)
-                    if len(parts) == 2:
-                        cookie_list.append(
-                            {
-                                "name": parts[0].strip(),
-                                "value": parts[1].strip(),
-                                "domain": ".xiaoheihe.cn",
-                                "path": "/",
-                            }
-                        )
-                    else:
-                        self._log(f"警告：跳过了格式无效的 Cookie 项 - {pair}")
-                if cookie_list:
-                    await context.add_cookies(cookie_list)
-                    self._log(f"已注入 {len(cookie_list)} 个 Cookie")
+                await context.add_cookies(cookie_list)
+                self._log(f"已注入 {len(cookie_list)} 个 Cookie")
             except Exception as e:
                 self._log(f"注入 Cookie 时发生异常，关闭上下文: {e}")
                 await context.close()
@@ -138,6 +140,99 @@ class XiaoheihePlugin(Star):
         async with self._semaphore:
             async for result in self._process_screenshot(event, game):
                 yield result
+
+    @filter.command("小黑盒扫码登录", ignore_prefix=True)
+    async def cmd_login(self, event: AstrMessageEvent):
+        """扫码登录小黑盒，自动获取 Cookie"""
+        try:
+            _plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            if _plugin_dir not in sys.path:
+                sys.path.insert(0, _plugin_dir)
+            from xiaoheihe_login import (
+                XiaoheiheLoginClient,
+                generate_qr_png,
+                LoginState,
+            )
+        except ImportError as e:
+            yield event.plain_result(
+                f"扫码登录模块加载失败，请确保已安装依赖（aiohttp、qrcode）：{e}"
+            )
+            return
+
+        yield event.plain_result("正在生成登录二维码，请稍候...")
+
+        client = XiaoheiheLoginClient(device_id=self._login_device_id)
+        try:
+            qr_session = await client.request_qr()
+        except Exception as e:
+            logger.error(f"[小黑盒] 获取二维码失败: {e}")
+            yield event.plain_result(f"获取二维码失败：{e}")
+            return
+
+        qr_bytes = generate_qr_png(qr_session.qr_content)
+        qr_path = self._save_temp_image(qr_bytes, suffix=".png")
+        yield event.chain_result([
+            Comp.Plain("请使用小黑盒 App 扫描下方二维码完成登录"),
+            Comp.Image.fromFileSystem(qr_path),
+        ])
+        self._schedule_cleanup(qr_path)
+
+        last_state = None
+        deadline = min(qr_session.expires_at, time.time() + self.login_timeout)
+        while time.time() < deadline:
+            await asyncio.sleep(self._login_poll_interval)
+            try:
+                result = await client.check_qr(qr_session)
+            except Exception as e:
+                self._log(f"轮询登录状态失败: {e}")
+                continue
+            if result.state != last_state:
+                self._log(f"登录状态变更: {result.state.value}")
+                last_state = result.state
+                if result.state == LoginState.SCANNED_WAITING_CONFIRM:
+                    yield event.plain_result("已扫描，请在手机上确认登录")
+                elif result.state == LoginState.SUCCESS:
+                    self._save_credentials(
+                        result.cookies, result.uid, result.nickname, client.device_id
+                    )
+                    name = result.nickname or result.uid or "未知"
+                    yield event.plain_result(f"登录成功！欢迎，{name}")
+                    return
+                elif result.state in (LoginState.EXPIRED, LoginState.FAILED):
+                    msg = result.message or "二维码已过期或登录失败"
+                    yield event.plain_result(
+                        f"登录失败：{msg}，请重新发起 /小黑盒扫码登录"
+                    )
+                    return
+        yield event.plain_result("二维码已过期，请重新发起 /小黑盒扫码登录")
+
+    @filter.command("小黑盒退出登录", ignore_prefix=True)
+    async def cmd_logout(self, event: AstrMessageEvent):
+        """退出登录，清除保存的凭证"""
+        if not self._login_cookies:
+            yield event.plain_result("当前未通过扫码登录，无需退出。")
+            return
+        name = self._login_nickname or self._login_uid or "未知"
+        self._clear_credentials()
+        yield event.plain_result(f"已退出登录（{name}），保存的凭证已清除。")
+
+    @filter.command("小黑盒登录状态", ignore_prefix=True)
+    async def cmd_login_status(self, event: AstrMessageEvent):
+        """查看当前登录状态"""
+        if self._login_cookies:
+            name = self._login_nickname or self._login_uid or "未知"
+            yield event.plain_result(
+                f"当前已通过扫码登录：{name}\n如需重新登录，请使用 /小黑盒扫码登录"
+            )
+        elif self.cookies:
+            yield event.plain_result(
+                "当前使用配置中的 Cookie（手动填写），未使用扫码登录。\n"
+                "如需扫码登录，请使用 /小黑盒扫码登录"
+            )
+        else:
+            yield event.plain_result(
+                "当前未登录。\n请使用 /小黑盒扫码登录 或在配置中填写 Cookie。"
+            )
 
     async def _process_screenshot(self, event: AstrMessageEvent, game: str):
         short_timeout = max(3000, self.wait_timeout // 12)
@@ -431,13 +526,18 @@ class XiaoheihePlugin(Star):
         if not target_url:
             return
 
-        self._log(f"检测到小黑盒链接，开始截图: {target_url}")
-
-        yield event.plain_result("检测到小黑盒链接，正在为您生成截图，请稍候...")
-
-        async with self._semaphore:
-            async for result in self._process_link_screenshot(event, target_url):
-                yield result
+        if self.link_text_parse:
+            self._log(f"检测到小黑盒链接，开始解析内容: {target_url}")
+            yield event.plain_result("检测到小黑盒链接，正在为您解析内容，请稍候...")
+            async with self._semaphore:
+                async for result in self._process_link_text(event, target_url):
+                    yield result
+        else:
+            self._log(f"检测到小黑盒链接，开始截图: {target_url}")
+            yield event.plain_result("检测到小黑盒链接，正在为您生成截图，请稍候...")
+            async with self._semaphore:
+                async for result in self._process_link_screenshot(event, target_url):
+                    yield result
 
     async def _process_link_screenshot(self, event: AstrMessageEvent, target_url: str):
         context = None
@@ -480,7 +580,7 @@ class XiaoheihePlugin(Star):
                         break
 
             image_bytes = await self._take_screenshot_with_fallback(page, element, found_selector)
-
+            
             if not image_bytes:
                 raise RuntimeError("截图过程异常，未能获取到任何图像数据。")
 
@@ -496,6 +596,571 @@ class XiaoheihePlugin(Star):
             if context:
                 await context.close()
                 self._log("链接解析：浏览器上下文已关闭")
+
+    async def _process_link_text(self, event: AstrMessageEvent, target_url: str):
+        """直接调用小黑盒 API 解析帖子正文，以单条合并转发消息发送。"""
+        try:
+            parsed = self._parse_link_url(target_url)
+            if not parsed:
+                self._log(f"无法从链接中提取 link_id: {target_url}")
+                if self.link_text_fallback_screenshot:
+                    async for result in self._process_link_screenshot(event, target_url):
+                        yield result
+                else:
+                    yield event.plain_result("未能从该链接中识别到可解析的 ID，已按文字模式跳过截图。")
+                return
+
+            link_type, link_id = parsed
+            self._log(f"链接解析: type={link_type} id={link_id} url={target_url}")
+
+            payload = await self._fetch_link_api(link_type, link_id)
+            if link_type == "bbs":
+                content = self._parse_bbs_content(payload, target_url)
+            else:
+                content = self._parse_game_content(payload, target_url)
+            blocks = content.get("blocks") or []
+
+            for block in blocks:
+                if self.link_text_include_images and block.get("type") == "image":
+                    img_bytes = await self._download_image(block.get("url"))
+                    if img_bytes:
+                        block["image_bytes"] = img_bytes
+
+            has_content = any(
+                (b.get("type") == "text" and b.get("text"))
+                or (self.link_text_include_images and b.get("type") == "image" and b.get("image_bytes"))
+                for b in blocks
+            ) or any(content.get(key) for key in ("title", "author", "publish_time"))
+            if not has_content:
+                self._log("API 未解析到正文内容。")
+                if self.link_text_fallback_screenshot:
+                    async for result in self._process_link_screenshot(event, target_url):
+                        yield result
+                else:
+                    yield event.plain_result("未能解析到正文内容，已按文字模式跳过截图。")
+                return
+
+            uin = self._get_forward_uin(event)
+            node = self._build_forward_node(content, target_url, uin)
+            if not node:
+                yield event.plain_result("未能解析到任何内容，请稍后再试。")
+                return
+
+            yield event.chain_result([node])
+            self._log("链接解析（API 文字合并转发）完成")
+
+        except Exception as e:
+            logger.error(f"链接文字解析失败: {e}")
+            yield event.plain_result("内容解析失败，请稍后再试。")
+
+    def _parse_link_url(self, url: str):
+        """从小黑盒链接中提取 (类型, link_id)。
+
+        支持：community/app/post/<id>、bbs 帖子分享链接、带 ?link_id= 的链接、游戏专题页等。
+        """
+        from urllib.parse import urlsplit, parse_qsl
+
+        try:
+            parts = urlsplit(url)
+            path = (parts.path or "").strip("/")
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+
+            topic_match = re.search(r"(?:^|/)app/topic/game/(\d+)", path)
+            if topic_match:
+                return ("pc", topic_match.group(1))
+
+            for game_type, keys in {
+                "pc": ("steam_appid", "steam_app_id", "steamid"),
+                "console": ("console_appid", "console_id"),
+                "mobile": ("mobile_appid", "mobile_id"),
+            }.items():
+                for key in keys:
+                    value = str(query.get(key, "")).strip()
+                    if value.isdigit():
+                        return (game_type, value)
+
+            for key in ("link_id", "linkid", "id", "post_id"):
+                value = str(query.get(key, "")).strip()
+                if value.isdigit():
+                    return ("bbs", value)
+
+            segments = [s for s in path.split("/") if s]
+            for seg in reversed(segments):
+                clean = seg.split("?")[0].split("#")[0]
+                if clean.isdigit():
+                    return ("bbs", clean)
+
+            m = re.search(r"/(\d{4,})(?:/|$|\?)", url)
+            if m:
+                return ("bbs", m.group(1))
+        except Exception as e:
+            self._log(f"解析链接 id 失败: {e}")
+        return None
+
+    async def _fetch_link_api(self, link_type: str, link_id: str) -> dict:
+        """调用小黑盒 API 获取帖子正文数据（复用本地签名模块）。"""
+        try:
+            _plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            if _plugin_dir not in sys.path:
+                sys.path.insert(0, _plugin_dir)
+            from xiaoheihe_login import (
+                generate_hkey,
+                WEB_CLIENT_PARAMS,
+                API_BASE_URL,
+            )
+        except ImportError as e:
+            raise RuntimeError(f"签名模块加载失败: {e}")
+
+        import aiohttp
+
+        path_map = {
+            "bbs": "/bbs/app/link/tree/",
+            "pc": "/game/get_game_detail/",
+            "console": "/game/console/get_game_detail/",
+            "mobile": "/game/mobile/get_game_detail/",
+        }
+        api_path = path_map.get(link_type, path_map["bbs"])
+
+        base = {
+            **WEB_CLIENT_PARAMS,
+            "web_version": "2.5",
+            "x_client_type": "web",
+            "x_app": "heybox_website",
+            "x_os_type": "Android",
+        }
+        if link_type == "bbs":
+            base["link_id"] = str(link_id)
+            base["limit"] = "20"
+        elif link_type == "pc":
+            base["steam_appid"] = str(link_id)
+        else:
+            base["appid"] = str(link_id)
+
+        params = self._sign_link_api_params(api_path, base, generate_hkey)
+        url = f"{API_BASE_URL}{api_path}"
+
+        headers = {
+            "Accept": "application/json",
+            "Referer": "https://www.xiaoheihe.cn/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        cookies = self._build_cookie_dict()
+
+        timeout = aiohttp.ClientTimeout(total=max(20, self.wait_timeout // 1000))
+        async with aiohttp.ClientSession(
+            cookie_jar=aiohttp.CookieJar(unsafe=True), timeout=timeout
+        ) as session:
+            async with session.get(
+                url, params=params, headers=headers, cookies=cookies
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+
+        self._log(f"API 响应: {str(data)[:200]}")
+        if not isinstance(data, dict):
+            raise RuntimeError("API 返回的数据格式无效")
+        return data
+
+    def _sign_link_api_params(self, api_path: str, base: dict, generate_hkey):
+        """按小黑盒 Web 端规则签名链接解析接口请求。"""
+        params = dict(base or {})
+        timestamp = int(time.time())
+        nonce = hashlib.md5(
+            f"{timestamp}{secrets.token_hex(16)}".encode(), usedforsecurity=False
+        ).hexdigest().upper()
+        params["_time"] = str(timestamp)
+        params["nonce"] = nonce
+        params["hkey"] = generate_hkey(api_path, timestamp + 1, nonce)
+        if self._login_device_id:
+            params["device_id"] = self._login_device_id
+        return params
+
+    def _parse_bbs_content(self, payload: dict, source_url: str) -> dict:
+        """从 bbs/app/link/tree 响应中提取标题/作者/时间与按原文顺序的图文块。"""
+        result = {"title": "", "author": "", "publish_time": "", "blocks": []}
+
+        body = payload.get("result") or payload.get("data") or {}
+        if not isinstance(body, dict):
+            return result
+
+        post = body.get("link") or body.get("post") or body.get("topic") or body
+
+        title = post.get("title") or post.get("name") or body.get("title") or ""
+        result["title"] = str(title).strip()
+
+        user = post.get("user") or post.get("author") or {}
+        if isinstance(user, dict):
+            result["author"] = str(
+                user.get("name")
+                or user.get("nickname")
+                or user.get("username")
+                or ""
+            ).strip()
+        elif isinstance(user, str):
+            result["author"] = user.strip()
+
+        ts = post.get("creation_time") or post.get("created_at") or post.get("time")
+        if ts:
+            try:
+                from datetime import datetime
+                result["publish_time"] = datetime.fromtimestamp(
+                    int(ts)
+                ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                result["publish_time"] = str(ts)
+
+        content_list = (
+            post.get("content_list")
+            or post.get("content")
+            or body.get("content_list")
+            or []
+        )
+        if isinstance(content_list, str):
+            text = self._clean_html(content_list)
+            if text.strip():
+                result["blocks"].append({"type": "text", "text": text})
+        elif isinstance(content_list, list):
+            for item in content_list:
+                if isinstance(item, dict):
+                    self._collect_content_blocks(item, result["blocks"])
+
+        if not result["blocks"]:
+            text = self._clean_html(
+                str(
+                    post.get("text")
+                    or post.get("content_text")
+                    or post.get("markdown_content")
+                    or ""
+                )
+            )
+            if text.strip():
+                result["blocks"].append({"type": "text", "text": text})
+
+        if not any(b.get("type") == "image" for b in result["blocks"]):
+            img_list = post.get("imgs") or post.get("pictures") or []
+            if isinstance(img_list, list):
+                for img in img_list[:10]:
+                    url = self._extract_img_url(img)
+                    if url:
+                        result["blocks"].append({"type": "image", "url": url})
+
+        return result
+
+    def _parse_game_content(self, payload: dict, source_url: str) -> dict:
+        """从游戏详情 API 响应中提取可读的文字与媒体。"""
+        result = {"title": "", "author": "", "publish_time": "", "blocks": []}
+
+        body = payload.get("result") or payload.get("data") or {}
+        if not isinstance(body, dict):
+            return result
+
+        name = self._first_text(body, "name", "title", "game_name")
+        name_en = self._first_text(body, "name_en", "english_name", "subtitle")
+        if name and name_en and name_en.casefold() != name.casefold():
+            result["title"] = f"{name} / {name_en}"
+        else:
+            result["title"] = name or name_en or "小黑盒游戏详情"
+
+        lines = []
+        self._append_field(lines, "小黑盒评分", self._first_text(body, "score", "heybox_score", "impression_score"))
+        self._append_field(lines, "评分说明", self._first_text(body, "score_desc"))
+        self._append_field(lines, "关注人数", self._first_text(body, "follow_num_str", "follow_num", "user_num"))
+        self._append_field(lines, "平台", self._format_value(body.get("platforms_list") or body.get("platforms") or body.get("platf")))
+        self._append_field(lines, "标签", self._format_tags(body.get("common_tags") or body.get("tags")))
+        self._append_field(lines, "价格", self._format_price(body))
+
+        desc = self._clean_html(
+            self._first_text(
+                body,
+                "about_the_game",
+                "desc",
+                "description",
+                "share_desc",
+                "brief",
+            )
+        )
+        if desc:
+            lines.append("简介：")
+            lines.append(self._truncate_text(desc, 1000))
+
+        if lines:
+            result["blocks"].append({"type": "text", "text": "\n".join(lines)})
+
+        for url in self._collect_game_image_urls(body):
+            result["blocks"].append({"type": "image", "url": url})
+
+        return result
+
+    def _collect_game_image_urls(self, body: dict) -> list[str]:
+        """收集游戏封面与截图，去重并限制数量。"""
+        urls = []
+        for key in ("image", "share_img"):
+            url = self._extract_img_url(body.get(key))
+            if url:
+                urls.append(url)
+
+        topic_detail = body.get("topic_detail") or {}
+        if isinstance(topic_detail, dict):
+            url = self._extract_img_url(topic_detail.get("pic_url"))
+            if url:
+                urls.append(url)
+
+        screenshots = body.get("screenshots") or []
+        if isinstance(screenshots, list):
+            for item in screenshots:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").lower() == "movie":
+                    url = self._extract_img_url(item.get("thumbnail"))
+                else:
+                    url = self._extract_img_url(item.get("url") or item.get("thumbnail"))
+                if url:
+                    urls.append(url)
+
+        deduped = []
+        seen = set()
+        for url in urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+            if len(deduped) >= 4:
+                break
+        return deduped
+
+    def _first_text(self, data: dict, *keys: str) -> str:
+        for key in keys:
+            value = data.get(key)
+            if value is not None and value != "":
+                return self._format_value(value)
+        return ""
+
+    def _append_field(self, lines: list[str], label: str, value: str):
+        value = str(value or "").strip()
+        if value:
+            lines.append(f"{label}：{value}")
+
+    def _format_value(self, value) -> str:
+        if value is None or value == "":
+            return ""
+        if isinstance(value, (list, tuple, set)):
+            parts = [self._format_value(item) for item in value]
+            return "、".join(part for part in parts if part)
+        if isinstance(value, dict):
+            for key in ("name", "title", "label", "text", "value"):
+                text = value.get(key)
+                if text is not None and text != "":
+                    return self._format_value(text)
+            return ""
+        return str(value).strip()
+
+    def _format_tags(self, value) -> str:
+        if isinstance(value, list):
+            tags = []
+            for item in value:
+                text = self._format_value(item)
+                if text:
+                    tags.append(text)
+            return "、".join(tags[:12])
+        return self._format_value(value)
+
+    def _format_price(self, body: dict) -> str:
+        price_text = self._first_text(body, "price_desc", "price", "price_rich_text")
+        if price_text:
+            return price_text
+        if body.get("is_free") in (1, True, "1", "true", "True"):
+            return "免费"
+        return ""
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        text = str(text or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
+
+    def _collect_content_blocks(self, item: dict, blocks: list):
+        """递归收集 content_list 节点，保持原文图文顺序。"""
+        node_type = str(item.get("type") or item.get("box_type") or "").lower()
+
+        if node_type in ("text", "txt", "paragraph", "p"):
+            text = self._clean_html(
+                str(item.get("text") or item.get("content") or item.get("value") or "")
+            )
+            if text.strip():
+                blocks.append({"type": "text", "text": text})
+            return
+
+        if node_type in ("image", "img", "pic", "picture"):
+            url = self._extract_img_url(item)
+            if url:
+                blocks.append({"type": "image", "url": url})
+            return
+
+        url = self._extract_img_url(item)
+        if url:
+            blocks.append({"type": "image", "url": url})
+            return
+
+        text = self._clean_html(str(item.get("text") or item.get("content") or ""))
+        if text.strip():
+            blocks.append({"type": "text", "text": text})
+
+        for key in ("content_list", "list", "children", "items"):
+            children = item.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        self._collect_content_blocks(child, blocks)
+
+    def _extract_img_url(self, item) -> str:
+        """从图片节点提取并优化为原图 URL。"""
+        if isinstance(item, str):
+            url = item
+        elif isinstance(item, dict):
+            url = (
+                item.get("url")
+                or item.get("src")
+                or item.get("origin_url")
+                or item.get("full")
+                or item.get("value")
+                or ""
+            )
+            if not url:
+                origin = item.get("origin") or item.get("size_big") or {}
+                if isinstance(origin, dict):
+                    url = origin.get("url") or origin.get("src") or ""
+        else:
+            url = ""
+        url = str(url).strip()
+        if not url:
+            return ""
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url.startswith("http"):
+            return ""
+        # 利用小黑盒 CDN 特性获取原图
+        if "?" in url and not url.endswith("\\"):
+            url = url + "\\"
+        return url
+
+    def _clean_html(self, text: str) -> str:
+        """去除 HTML 标签，保留纯文本。"""
+        if not text:
+            return ""
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = (
+            text.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+        )
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    async def _download_image(self, url: str):
+        """下载图片字节（携带登录态）。"""
+        if not url:
+            return None
+        try:
+            import aiohttp
+
+            headers = {
+                "Referer": "https://www.xiaoheihe.cn/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            }
+            cookies = self._build_cookie_dict()
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers, cookies=cookies) as resp:
+                    if resp.ok:
+                        body = await resp.read()
+                        if body:
+                            return bytes(body)
+        except Exception as e:
+            self._log(f"下载图片失败 {url}: {e}")
+        return None
+
+    def _build_cookie_dict(self) -> dict:
+        """构建用于 HTTP 请求的 cookie 字典（扫码登录优先）。"""
+        if self._login_cookies:
+            return dict(self._login_cookies)
+        cookies = {}
+        if self.cookies:
+            for pair in self.cookies.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                kv = pair.split("=", 1)
+                if len(kv) == 2:
+                    cookies[kv[0].strip()] = kv[1].strip()
+        return cookies
+
+    def _build_forward_node(self, content: dict, source_url: str, uin: str):
+        """将解析结果按原文顺序组装为单条合并转发节点。"""
+        nickname = "小黑盒解析"
+
+        header_lines = []
+        if content.get("title"):
+            header_lines.append(content["title"])
+        meta_parts = []
+        if content.get("author"):
+            meta_parts.append(content["author"])
+        if content.get("publish_time"):
+            meta_parts.append(content["publish_time"])
+        if meta_parts:
+            header_lines.append(" · ".join(meta_parts))
+        header_lines.append(f"来源：{source_url}")
+
+        components = []
+        text_buf = "\n".join(header_lines)
+
+        for block in content.get("blocks") or []:
+            if block.get("type") == "text" and block.get("text"):
+                if text_buf:
+                    text_buf += "\n\n" + block["text"]
+                else:
+                    text_buf = block["text"]
+            elif self.link_text_include_images and block.get("type") == "image" and block.get("image_bytes"):
+                if text_buf:
+                    components.append(Comp.Plain(text_buf))
+                    text_buf = ""
+                try:
+                    components.append(Comp.Image.fromBytes(block["image_bytes"]))
+                except Exception as e:
+                    self._log(f"构造图片组件失败: {e}")
+
+        if text_buf:
+            components.append(Comp.Plain(text_buf))
+
+        if not components:
+            return None
+
+        return Comp.Node(components, uin=uin, name=nickname)
+    def _get_forward_uin(self, event: AstrMessageEvent) -> str:
+        """获取用于合并转发节点的发送者 ID。"""
+        try:
+            uin = event.get_self_id()
+            if uin:
+                return str(uin)
+        except Exception:
+            pass
+        try:
+            uin = getattr(getattr(event, "message_obj", None), "self_id", None)
+            if uin:
+                return str(uin)
+        except Exception:
+            pass
+        return "10000"
 
     # ==================== 工具方法 ====================
 
@@ -719,7 +1384,7 @@ class XiaoheihePlugin(Star):
     async def _take_screenshot_with_fallback(self, page, element=None, found_selector="") -> bytes:
         """带降级策略的网页截图"""
         image_bytes = None
-
+        
         if element:
             try:
                 await element.scroll_into_view_if_needed(timeout=5000)
@@ -740,15 +1405,15 @@ class XiaoheihePlugin(Star):
         except Exception as fp_err:
             reason = "元素截图后全页截图也失败" if element else "全页截图失败"
             self._log(f"{reason}: {fp_err}，回退到最后手段：视口截图")
-
+        
         image_bytes = await page.screenshot(type="jpeg", quality=self.image_quality)
         return image_bytes
 
-    def _save_temp_image(self, image_bytes: bytes) -> str:
+    def _save_temp_image(self, image_bytes: bytes, suffix: str = ".jpg") -> str:
         """保存临时截图并返回文件路径"""
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(
-            temp_dir, f"xiaoheihe_{uuid.uuid4().hex}.jpg"
+            temp_dir, f"xiaoheihe_{uuid.uuid4().hex}{suffix}"
         )
         with open(file_path, "wb") as f:
             f.write(image_bytes)
@@ -766,8 +1431,94 @@ class XiaoheihePlugin(Star):
                     self._log(f"已清理临时截图: {file_path}")
             except Exception as e:
                 self._log(f"清理临时截图失败 {file_path}: {e}")
-
+        
         asyncio.get_running_loop().call_later(delay, cleanup)
+
+    # ==================== 扫码登录 ====================
+
+    def _build_cookie_list(self) -> list[dict[str, str]]:
+        """构建注入浏览器的 Cookie 列表，扫码登录 Cookie 优先"""
+        if self._login_cookies:
+            self._log("使用扫码登录的 Cookie")
+            return [
+                {"name": k, "value": v, "domain": ".xiaoheihe.cn", "path": "/"}
+                for k, v in self._login_cookies.items()
+            ]
+        if self.cookies:
+            cookie_list = []
+            for pair in self.cookies.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                parts = pair.split("=", 1)
+                if len(parts) == 2:
+                    cookie_list.append(
+                        {
+                            "name": parts[0].strip(),
+                            "value": parts[1].strip(),
+                            "domain": ".xiaoheihe.cn",
+                            "path": "/",
+                        }
+                    )
+                else:
+                    self._log(f"警告：跳过了格式无效的 Cookie 项 - {pair}")
+            return cookie_list
+        return []
+
+    def _load_credentials(self):
+        """加载保存的扫码登录凭证"""
+        try:
+            if os.path.exists(self._credentials_path):
+                with open(self._credentials_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cookies = data.get("cookies", {})
+                if isinstance(cookies, dict) and cookies:
+                    self._login_cookies = {
+                        str(k): str(v) for k, v in cookies.items()
+                    }
+                    self._login_uid = str(data.get("uid", ""))
+                    self._login_nickname = str(data.get("nickname", ""))
+                    self._login_device_id = str(data.get("device_id", ""))
+                    self._log(
+                        f"已加载扫码登录凭证 "
+                        f"(uid={self._login_uid}, 昵称={self._login_nickname})"
+                    )
+        except Exception as e:
+            self._log(f"加载登录凭证失败: {e}")
+
+    def _save_credentials(
+        self, cookies: dict[str, str], uid: str, nickname: str, device_id: str
+    ):
+        """保存扫码登录凭证到文件"""
+        from datetime import datetime
+
+        data = {
+            "cookies": cookies,
+            "uid": uid,
+            "nickname": nickname,
+            "device_id": device_id,
+            "logged_in_at": datetime.now().isoformat(),
+        }
+        with open(self._credentials_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        self._login_cookies = cookies
+        self._login_uid = uid
+        self._login_nickname = nickname
+        self._login_device_id = device_id
+        self._log(f"扫码登录凭证已保存 (uid={uid}, 昵称={nickname})")
+
+    def _clear_credentials(self):
+        """清除保存的扫码登录凭证"""
+        self._login_cookies = {}
+        self._login_uid = ""
+        self._login_nickname = ""
+        self._login_device_id = ""
+        try:
+            if os.path.exists(self._credentials_path):
+                os.remove(self._credentials_path)
+                self._log("已删除凭证文件")
+        except Exception as e:
+            self._log(f"删除凭证文件失败: {e}")
 
     # ==================== 生命周期 ====================
 
@@ -785,7 +1536,7 @@ class XiaoheihePlugin(Star):
             self._browser = None
             self._playwright = None
             self._playwright_manager = None
-
+        
         # 卸载时彻底清理可能的残留文件
         for file_path in list(self._temp_files):
             try:

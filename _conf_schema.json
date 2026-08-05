@@ -1,9 +1,15 @@
 {
     "cookies": {
-        "description": "小黑盒 Cookie（建议填写）",
+        "description": "小黑盒 Cookie（可选）",
         "type": "string",
-        "hint": "登录小黑盒后获取的 Cookie 字符串。填写后可正常使用搜索功能并访问需要登录才能查看的内容。获取方式详见 README。",
+        "hint": "登录小黑盒后获取的 Cookie 字符串。也可以不填写，直接在聊天中使用「扫码登录」指令完成登录。详见 README。",
         "default": ""
+    },
+    "login_timeout": {
+        "description": "扫码登录等待超时（秒）",
+        "type": "int",
+        "hint": "发起扫码登录后，等待用户扫码确认的超时时间（秒）。超时后需重新发起。",
+        "default": 120
     },
     "wait_timeout": {
         "description": "页面加载超时时间（毫秒）",
@@ -41,13 +47,13 @@
         "hint": "是否在截图前以文本形式显示当前在线人数。",
         "default": true
     },
-    "enable_link_preview": {
-        "description": "自动解析小黑盒链接",
-        "type": "bool",
-        "hint": "启用后，当用户发送小黑盒链接时，插件会自动对该链接进行截图并回复。",
-        "default": true
-    },
-    "debug": {
+   "enable_link_preview": {
+       "description": "自动解析小黑盒链接",
+       "type": "bool",
+       "hint": "启用后，当用户发送小黑盒链接时，插件会自动解析该链接并使用截图回复。",
+       "default": true
+   },
+   "debug": {
         "description": "调试模式",
         "type": "bool",
         "hint": "启用后，将在控制台输出详细的调试日志。",
