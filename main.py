@@ -42,8 +42,15 @@ class XiaoheihePlugin(Star):
         self.enable_link_preview: bool = config.get("enable_link_preview", True)
         self.link_text_parse: bool = config.get("link_text_parse", False)
         self.link_text_include_images: bool = config.get("link_text_include_images", True)
+        self.link_text_include_video: bool = config.get("link_text_include_video", True)
+        self.link_video_size_limit: int = int(config.get("link_video_size_limit", 100))
         self.link_text_fallback_screenshot: bool = config.get("link_text_fallback_screenshot", False)
         self.debug: bool = config.get("debug", False)
+
+        # 会话（UMO）白名单/黑名单
+        self.session_filter_mode: str = str(config.get("session_filter_mode", "off") or "off").strip().lower()
+        self.session_whitelist: list[str] = self._parse_session_list(config.get("session_whitelist", []))
+        self.session_blacklist: list[str] = self._parse_session_list(config.get("session_blacklist", []))
 
         # Playwright 实例（延迟初始化）
         self._playwright_manager = None
@@ -509,6 +516,66 @@ class XiaoheihePlugin(Star):
 
         return None
 
+    def _parse_session_list(self, value) -> list[str]:
+        """把配置中的会话列表统一成去空白后的字符串列表。"""
+        items = []
+        if isinstance(value, str):
+            raw = re.split(r"[\n,，;；]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw = list(value)
+        else:
+            raw = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text:
+                items.append(text)
+        return items
+
+    def _get_session_umo(self, event: AstrMessageEvent) -> str:
+        """获取当前会话的 unified_msg_origin（UMO）。"""
+        try:
+            umo = event.unified_msg_origin
+            if umo:
+                return str(umo)
+        except Exception:
+            pass
+        try:
+            umo = getattr(getattr(event, "message_obj", None), "unified_msg_origin", None)
+            if umo:
+                return str(umo)
+        except Exception:
+            pass
+        return ""
+
+    def _is_session_allowed(self, event: AstrMessageEvent) -> bool:
+        """按 UMO 白名单/黑名单判断当前会话是否允许自动解析。"""
+        mode = self.session_filter_mode
+        if mode not in {"whitelist", "blacklist"}:
+            return True
+
+        umo = self._get_session_umo(event)
+        if not umo:
+            # 拿不到 UMO 时，白名单模式默认拦截、黑名单模式默认放行。
+            return mode != "whitelist"
+
+        if mode == "whitelist":
+            return any(self._session_matches(umo, rule) for rule in self.session_whitelist)
+        return not any(self._session_matches(umo, rule) for rule in self.session_blacklist)
+
+    def _session_matches(self, umo: str, rule: str) -> bool:
+        """会话匹配：支持完整 UMO，也支持只填群号/会话 ID 的子串匹配。"""
+        umo = str(umo or "").strip()
+        rule = str(rule or "").strip()
+        if not umo or not rule:
+            return False
+        if umo == rule:
+            return True
+        # 允许只填群号/用户号：按冒号分段后精确匹配任意一段。
+        segments = re.split(r"[:：]", umo)
+        if rule in segments:
+            return True
+        return False
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，处理无前缀指令和自动解析小黑盒链接"""
@@ -517,6 +584,10 @@ class XiaoheihePlugin(Star):
         # 0. 无前缀触发逻辑已移除，由 @filter.command(ignore_prefix=True) 处理
 
         if not self.enable_link_preview:
+            return
+
+        if not self._is_session_allowed(event):
+            self._log(f"当前会话不在允许列表内，跳过链接解析: {self._get_session_umo(event)}")
             return
 
         target_url = self._extract_xiaoheihe_url(event)
@@ -629,6 +700,10 @@ class XiaoheihePlugin(Star):
                     cover_bytes = await self._download_image(cover_url)
                     if cover_bytes:
                         content["cover_bytes"] = cover_bytes
+                if self.link_text_include_video:
+                    video_url = self._extract_bbs_video_url(payload)
+                    if video_url:
+                        content["video_url"] = video_url
             content["blocks"] = self._dedupe_link_blocks(content.get("blocks") or [])
             blocks = content.get("blocks") or []
 
@@ -642,7 +717,7 @@ class XiaoheihePlugin(Star):
                 (b.get("type") == "text" and b.get("text"))
                 or (self.link_text_include_images and b.get("type") == "image" and b.get("image_bytes"))
                 for b in blocks
-            ) or any(content.get(key) for key in ("title", "author", "publish_time"))
+            ) or any(content.get(key) for key in ("title", "author", "publish_time", "video_url"))
             if not has_content:
                 self._log("API 未解析到正文内容。")
                 fallback_content = await self._fallback_parse_xiaoheihe_page(target_url)
@@ -670,6 +745,11 @@ class XiaoheihePlugin(Star):
 
             yield event.chain_result(nodes)
             self._log("链接解析（API 合并转发）完成")
+
+            video_url = content.get("video_url")
+            if self.link_text_include_video and video_url:
+                async for result in self._send_link_video(event, video_url):
+                    yield result
 
         except Exception as e:
             logger.error(f"链接文字解析失败: {e}")
@@ -794,8 +874,15 @@ class XiaoheihePlugin(Star):
             if not text:
                 return None
 
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if not lines:
+            lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not self._is_xhh_boilerplate_line(line.strip())
+            ]
+            # 过滤掉小黑盒页脚/导航等样板文案后，正文往往所剩无几，
+            # 说明网页是未渲染的单页外壳，此时不要把页脚当正文发出去。
+            meaningful = [line for line in lines if len(line) >= 8]
+            if len("".join(meaningful)) < 40:
                 return None
 
             title = lines[0]
@@ -824,6 +911,39 @@ class XiaoheihePlugin(Star):
         finally:
             if context:
                 await context.close()
+
+    def _is_xhh_boilerplate_line(self, line: str) -> bool:
+        """识别小黑盒网页外壳里的导航、页脚、备案等样板文字。"""
+        line = str(line or "").strip()
+        if not line:
+            return True
+        if line in {".", "·", "•"}:
+            return True
+        boilerplate_keywords = (
+            "下载小黑盒",
+            "steam玩家必备",
+            "小黑盒加速器",
+            "黑盒语音",
+            "黑盒工坊",
+            "加入我们",
+            "联系我们",
+            "关于我们",
+            "京公网安备",
+            "京ICP备",
+            "京网文",
+            "京ICP证",
+            "违法和不良信息举报",
+            "举报电话",
+            "立即下载",
+            "打开App",
+            "打开小黑盒",
+            "版权所有",
+        )
+        lowered = line.lower()
+        for keyword in boilerplate_keywords:
+            if keyword.lower() in lowered:
+                return True
+        return False
 
     async def _fetch_link_api(self, link_type: str, link_id: str) -> dict:
         """调用小黑盒 API 获取帖子正文数据（复用本地签名模块）。"""
@@ -1390,6 +1510,87 @@ class XiaoheihePlugin(Star):
             self._log(f"下载图片失败 {url}: {e}")
         return None
 
+    def _extract_bbs_video_url(self, payload: dict) -> str:
+        """从 bbs/app/link/tree 响应中提取帖子视频直链。
+
+        参考 rconsole-plugin：仅在 has_video == 1 时才取 video_url。
+        """
+        try:
+            link = (payload.get("result") or {}).get("link") or {}
+        except Exception:
+            return ""
+        if not isinstance(link, dict):
+            return ""
+        has_video = link.get("has_video")
+        video_url = link.get("video_url") or link.get("videoUrl") or ""
+        if has_video not in (1, "1", True) and not video_url:
+            return ""
+        video_url = str(video_url).strip().replace("\\/", "/").replace("\\", "")
+        if video_url.startswith("//"):
+            video_url = "https:" + video_url
+        if not video_url.startswith("http"):
+            return ""
+        return video_url
+
+    async def _send_link_video(self, event: AstrMessageEvent, video_url: str):
+        """下载并发送小黑盒帖子视频，超过体积上限时改发直链。"""
+        try:
+            video_bytes = await self._download_video(video_url)
+            if not video_bytes:
+                yield event.plain_result(f"视频解析成功，但下载失败，直链：\n{video_url}")
+                return
+
+            size_mb = len(video_bytes) / (1024 * 1024)
+            if self.link_video_size_limit > 0 and size_mb > self.link_video_size_limit:
+                self._log(
+                    f"视频体积 {size_mb:.1f}MB 超过上限 {self.link_video_size_limit}MB，改发直链"
+                )
+                yield event.plain_result(
+                    f"视频体积约 {size_mb:.0f}MB，超过发送上限，直链：\n{video_url}"
+                )
+                return
+
+            video_path = self._save_temp_image(video_bytes, suffix=".mp4")
+            try:
+                yield event.chain_result([Comp.Video.fromFileSystem(video_path)])
+            except Exception as e:
+                self._log(f"以文件方式发送视频失败，尝试直链: {e}")
+                yield event.plain_result(f"视频解析成功，直链：\n{video_url}")
+            finally:
+                self._schedule_cleanup(video_path, delay=60.0)
+        except Exception as e:
+            self._log(f"发送视频失败 {video_url}: {e}")
+            yield event.plain_result(f"视频解析成功，但发送失败，直链：\n{video_url}")
+
+    async def _download_video(self, url: str):
+        """下载视频字节（携带登录态）。"""
+        if not url:
+            return None
+        try:
+            import aiohttp
+
+            headers = {
+                "Referer": "https://www.xiaoheihe.cn/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            }
+            cookies = self._build_cookie_dict()
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers, cookies=cookies) as resp:
+                    if resp.ok:
+                        body = await resp.read()
+                        if body:
+                            return bytes(body)
+                    else:
+                        self._log(f"下载视频 HTTP 状态异常 {resp.status}: {url}")
+        except Exception as e:
+            self._log(f"下载视频失败 {url}: {e}")
+        return None
+
     def _build_cookie_dict(self) -> dict:
         """构建用于 HTTP 请求的 cookie 字典（扫码登录优先）。"""
         if self._login_cookies:
@@ -1460,7 +1661,8 @@ class XiaoheihePlugin(Star):
             header_lines.append(" · ".join(meta_parts))
 
         if header_lines:
-            components.append(Comp.Plain("\n\n".join(header_lines).strip()))
+            # 合并转发里相邻的 Plain 组件会直接拼接，末尾补空行避免作者名与正文首行黏在一起。
+            components.append(Comp.Plain("\n\n".join(header_lines).strip() + "\n\n"))
 
         def flush_text_node():
             nonlocal pending_text

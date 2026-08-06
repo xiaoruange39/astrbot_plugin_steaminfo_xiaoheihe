@@ -53,13 +53,44 @@
        "hint": "启用后，当用户发送小黑盒链接时，插件会自动解析该链接。默认使用截图回复；开启「文字模式」后改为文字模式。",
        "default": true
    },
-   "link_text_parse": {
-       "description": "文字模式",
-       "type": "bool",
-       "hint": "启用后，自动解析小黑盒链接时不再截图，而是提取正文文字与图片，并按原文顺序放入文字模式中。",
-       "default": false
-   },
-   "debug": {
+  "link_text_parse": {
+      "description": "文字模式",
+      "type": "bool",
+      "hint": "启用后，自动解析小黑盒链接时不再截图，而是提取正文文字与图片，并按原文顺序放入文字模式中。",
+      "default": false
+  },
+  "link_text_include_video": {
+      "description": "文字模式解析视频",
+      "type": "bool",
+      "hint": "文字模式下，若帖子包含视频，则额外下载并发送视频。超过体积上限时会改发视频直链。",
+      "default": true
+  },
+  "link_video_size_limit": {
+      "description": "视频发送体积上限（MB）",
+      "type": "int",
+      "hint": "下载的视频超过该体积（MB）时不再直接发送，改为发送视频直链。设为 0 表示不限制。",
+      "default": 100
+  },
+  "session_filter_mode": {
+      "description": "会话过滤模式（白/黑名单）",
+      "type": "string",
+      "hint": "自动解析链接时按会话 UMO 过滤。off=不过滤；whitelist=仅名单内会话生效；blacklist=名单内会话不生效。",
+      "options": ["off", "whitelist", "blacklist"],
+      "default": "off"
+  },
+  "session_whitelist": {
+      "description": "会话白名单（UMO）",
+      "type": "list",
+      "hint": "过滤模式为 whitelist 时生效。每行填一个会话 UMO（如 aiocqhttp:GroupMessage:123456），也可只填群号/会话 ID 做分段匹配。",
+      "default": []
+  },
+  "session_blacklist": {
+      "description": "会话黑名单（UMO）",
+      "type": "list",
+      "hint": "过滤模式为 blacklist 时生效。每行填一个会话 UMO（如 aiocqhttp:GroupMessage:123456），也可只填群号/会话 ID 做分段匹配。",
+      "default": []
+  },
+  "debug": {
         "description": "调试模式",
         "type": "bool",
         "hint": "启用后，将在控制台输出详细的调试日志。",

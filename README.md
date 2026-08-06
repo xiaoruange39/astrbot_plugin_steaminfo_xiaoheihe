@@ -98,6 +98,21 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 | `enable_link_preview` | bool | `true` | 是否自动解析小黑盒链接并截图 |
 | `link_text_parse` | bool | `false` | 启用后，链接解析改为文字模式 |
 
+### 视频解析
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `link_text_include_video` | bool | `true` | 文字模式下，帖子含视频时额外下载并发送视频，超过体积上限则改发直链 |
+| `link_video_size_limit` | int | `100` | 视频超过该体积（MB）时改发直链，设为 `0` 表示不限制 |
+
+### 会话过滤（白/黑名单）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `session_filter_mode` | string | `off` | 自动解析链接时按会话 UMO 过滤。`off` 不过滤；`whitelist` 仅名单内会话生效；`blacklist` 名单内会话不生效 |
+| `session_whitelist` | list | `[]` | 过滤模式为 `whitelist` 时生效，每行一个会话 UMO（如 `aiocqhttp:GroupMessage:123456`），也可只填群号/会话 ID 做分段匹配 |
+| `session_blacklist` | list | `[]` | 过滤模式为 `blacklist` 时生效，规则同上 |
+
 ### 调试
 
 | 配置项 | 类型 | 默认值 | 说明 |
