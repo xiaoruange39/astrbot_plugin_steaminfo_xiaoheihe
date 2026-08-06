@@ -65,9 +65,7 @@ class XiaoheihePlugin(Star):
         self._temp_files = set()
 
         # 扫码登录状态
-        self._credentials_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "credentials.json"
-        )
+        self._credentials_path = self._resolve_credentials_path()
         self._login_cookies: dict[str, str] = {}
         self._login_uid: str = ""
         self._login_nickname: str = ""
@@ -2065,6 +2063,8 @@ class XiaoheihePlugin(Star):
 
     def _load_credentials(self):
         """加载保存的扫码登录凭证"""
+        # 迁移旧版本存放在插件目录内的凭证文件，避免更新插件后掉登录。
+        self._migrate_legacy_credentials()
         try:
             if os.path.exists(self._credentials_path):
                 with open(self._credentials_path, "r", encoding="utf-8") as f:
@@ -2084,6 +2084,59 @@ class XiaoheihePlugin(Star):
         except Exception as e:
             self._log(f"加载登录凭证失败: {e}")
 
+    def _resolve_credentials_path(self) -> str:
+        """确定凭证文件路径，优先放在 AstrBot 数据目录，随插件更新保留。
+
+        插件更新会覆盖插件目录本身，因此把凭证写在插件目录内会掉登录。
+        这里优先使用 StarTools.get_data_dir()（data/plugin_data/<插件名>），
+        拿不到时退回到 AstrBot data 目录，最后才退回插件目录。
+        """
+        plugin_name = "astrbot_plugin_steaminfo_xiaoheihe"
+        try:
+            from astrbot.api.star import StarTools
+
+            data_dir = StarTools.get_data_dir(plugin_name)
+            if data_dir:
+                os.makedirs(str(data_dir), exist_ok=True)
+                return os.path.join(str(data_dir), "credentials.json")
+        except Exception as e:
+            self._log(f"获取插件数据目录失败，尝试其它路径: {e}")
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            base = os.path.join(
+                get_astrbot_data_path(), "plugin_data", plugin_name
+            )
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, "credentials.json")
+        except Exception as e:
+            self._log(f"获取 AstrBot 数据目录失败，退回插件目录: {e}")
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "credentials.json"
+        )
+
+    def _migrate_legacy_credentials(self):
+        """把旧版本写在插件目录内的 credentials.json 迁移到数据目录。"""
+        try:
+            legacy_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "credentials.json"
+            )
+            if legacy_path == self._credentials_path:
+                return
+            if os.path.exists(legacy_path) and not os.path.exists(self._credentials_path):
+                os.makedirs(os.path.dirname(self._credentials_path), exist_ok=True)
+                with open(legacy_path, "r", encoding="utf-8") as f:
+                    data = f.read()
+                with open(self._credentials_path, "w", encoding="utf-8") as f:
+                    f.write(data)
+                try:
+                    os.remove(legacy_path)
+                except Exception:
+                    pass
+                self._log(f"已迁移旧登录凭证到: {self._credentials_path}")
+        except Exception as e:
+            self._log(f"迁移旧登录凭证失败: {e}")
+
     def _save_credentials(
         self, cookies: dict[str, str], uid: str, nickname: str, device_id: str
     ):
@@ -2097,6 +2150,10 @@ class XiaoheihePlugin(Star):
             "device_id": device_id,
             "logged_in_at": datetime.now().isoformat(),
         }
+        try:
+            os.makedirs(os.path.dirname(self._credentials_path), exist_ok=True)
+        except Exception as e:
+            self._log(f"创建凭证目录失败: {e}")
         with open(self._credentials_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self._login_cookies = cookies
