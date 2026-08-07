@@ -71,6 +71,19 @@
       "hint": "下载的视频超过该体积（MB）时不再直接发送，改为发送视频直链。设为 0 表示不限制。",
       "default": 100
   },
+  "link_image_size_limit_kb": {
+      "description": "图片发送体积上限（KB）",
+      "type": "int",
+      "hint": "单张图片超过该体积（KB）时自动压缩后再发送，避免官方机器人上传时报 413。设为 0 表示不压缩。默认 2048。",
+      "default": 2048
+  },
+  "link_text_send_mode": {
+      "description": "文字模式发送方式",
+      "type": "string",
+      "hint": "文字模式的发送方式。auto=支持合并转发的平台走合并转发，官方机器人等不支持时自动回退为普通图文消息；forward=强制合并转发；plain=强制普通图文消息；markdown=QQ 官方机器人用原生 markdown 图文混排（需机器人有 markdown 权限，失败自动回退普通图文）。",
+      "options": ["auto", "forward", "plain", "markdown"],
+      "default": "auto"
+  },
   "session_filter_mode": {
       "description": "会话过滤模式（白/黑名单）",
       "type": "string",

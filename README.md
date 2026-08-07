@@ -97,6 +97,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 | `show_online_count` | bool | `true` | 截图回复时是否显示在线人数 |
 | `enable_link_preview` | bool | `true` | 是否自动解析小黑盒链接并截图 |
 | `link_text_parse` | bool | `false` | 启用后，链接解析改为文字模式 |
+| `link_text_send_mode` | string | `auto` | 文字模式发送方式。`auto` 支持合并转发的平台走合并转发、官方机器人等自动回退普通图文；`forward` 强制合并转发；`plain` 强制普通图文；`markdown` QQ 官方机器人用原生 markdown 图文（需机器人有 markdown 权限，失败自动回退普通图文） |
 
 ### 视频解析
 
@@ -104,6 +105,7 @@ git clone https://github.com/xiaoruange39/astrbot_plugin_steaminfo_xiaoheihe.git
 |--------|------|--------|------|
 | `link_text_include_video` | bool | `true` | 文字模式下，帖子含视频时额外下载并发送视频，超过体积上限则改发直链 |
 | `link_video_size_limit` | int | `100` | 视频超过该体积（MB）时改发直链，设为 `0` 表示不限制 |
+| `link_image_size_limit_kb` | int | `2048` | 单张图片超过该体积（KB）时自动压缩再发送，避免官方机器人 413，设为 `0` 表示不压缩 |
 
 ### 会话过滤（白/黑名单）
 

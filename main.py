@@ -44,6 +44,14 @@ class XiaoheihePlugin(Star):
         self.link_text_include_images: bool = config.get("link_text_include_images", True)
         self.link_text_include_video: bool = config.get("link_text_include_video", True)
         self.link_video_size_limit: int = int(config.get("link_video_size_limit", 100))
+        # 单张图片发送体积上限（KB）。官方机器人上传媒体体积卡得很严，
+        # 超过该阈值时用 Pillow 压缩后再发，避免 413 Request Entity Too Large。
+        self.link_image_size_limit_kb: int = int(config.get("link_image_size_limit_kb", 2048))
+        # 文字模式发送方式：auto / forward / plain
+        # 官方机器人（qq_official）无法发送合并转发，auto 会自动回退为普通消息。
+        self.link_text_send_mode: str = str(
+            config.get("link_text_send_mode", "auto") or "auto"
+        ).strip().lower()
         self.link_text_fallback_screenshot: bool = config.get("link_text_fallback_screenshot", False)
         self.debug: bool = config.get("debug", False)
 
@@ -689,6 +697,10 @@ class XiaoheihePlugin(Star):
                 content = self._parse_bbs_content(payload, target_url)
             else:
                 content = self._parse_game_content(payload, target_url)
+            # 用可点击的网页地址替换原始分享 API 链接，方便用户点开原文。
+            web_url = self._web_article_url(link_type, link_id)
+            if web_url:
+                content["source_url"] = web_url
             if link_type == "bbs":
                 cover_url = self._extract_img_url(
                     payload.get("result", {}).get("link", {}).get("thumb")
@@ -697,7 +709,7 @@ class XiaoheihePlugin(Star):
                 if cover_url:
                     cover_bytes = await self._download_image(cover_url)
                     if cover_bytes:
-                        content["cover_bytes"] = cover_bytes
+                        content["cover_bytes"] = self._compress_image_if_needed(cover_bytes)
                 if self.link_text_include_video:
                     video_url = self._extract_bbs_video_url(payload)
                     if video_url:
@@ -709,7 +721,7 @@ class XiaoheihePlugin(Star):
                 if self.link_text_include_images and block.get("type") == "image":
                     img_bytes = await self._download_image(block.get("url"))
                     if img_bytes:
-                        block["image_bytes"] = img_bytes
+                        block["image_bytes"] = self._compress_image_if_needed(img_bytes)
 
             has_content = any(
                 (b.get("type") == "text" and b.get("text"))
@@ -720,10 +732,13 @@ class XiaoheihePlugin(Star):
                 self._log("API 未解析到正文内容。")
                 fallback_content = await self._fallback_parse_xiaoheihe_page(target_url)
                 if fallback_content:
-                    nodes = self._build_link_forward_nodes(fallback_content, self._get_forward_uin(event))
-                    if nodes:
-                        yield event.chain_result(nodes)
-                        self._log("链接解析（网页兜底合并转发）完成")
+                    handled = False
+                    async for result in self._yield_link_content(event, fallback_content):
+                        yield result
+                    if fallback_content.get("_sent"):
+                        handled = True
+                    if handled:
+                        self._log("链接解析（网页兜底）完成")
                         return
                 if self.link_text_fallback_screenshot:
                     async for result in self._process_link_screenshot(event, target_url):
@@ -732,17 +747,17 @@ class XiaoheihePlugin(Star):
                     yield event.plain_result("未能解析到正文内容，已按文字模式跳过截图。")
                 return
 
-            nodes = self._build_link_forward_nodes(content, self._get_forward_uin(event))
-            if not nodes:
+            async for result in self._yield_link_content(event, content):
+                yield result
+            if not content.get("_sent"):
                 fallback_content = await self._fallback_parse_xiaoheihe_page(target_url)
                 if fallback_content:
-                    nodes = self._build_link_forward_nodes(fallback_content, self._get_forward_uin(event))
-                if not nodes:
+                    async for result in self._yield_link_content(event, fallback_content):
+                        yield result
+                if not (fallback_content and fallback_content.get("_sent")):
                     yield event.plain_result("未能解析到任何内容，请稍后再试。")
                     return
-
-            yield event.chain_result(nodes)
-            self._log("链接解析（API 合并转发）完成")
+            self._log("链接解析（文字模式）完成")
 
             video_url = content.get("video_url")
             if self.link_text_include_video and video_url:
@@ -801,6 +816,18 @@ class XiaoheihePlugin(Star):
         """小黑盒分享 API 的 link_id 可能是数字，也可能是字母数字混合。"""
         return bool(re.fullmatch(r"[A-Za-z0-9_-]{6,}", str(value or "").strip()))
 
+    def _web_article_url(self, link_type: str, link_id: str) -> str:
+        """根据类型和 ID 拼出可在浏览器/客户端打开的网页原文地址。"""
+        link_id = str(link_id or "").strip()
+        if not link_id:
+            return ""
+        if link_type == "bbs":
+            # 与 rconsole-plugin 保持一致的可打开地址。
+            return f"https://www.xiaoheihe.cn/app/bbs/link/{link_id}"
+        if link_type in {"pc", "console", "mobile"}:
+            return f"https://www.xiaoheihe.cn/app/topic/game/{link_type}/{link_id}"
+        return ""
+
     async def _fallback_parse_xiaoheihe_page(self, target_url: str) -> dict | None:
         """当分享 API 没有正文时，直接从网页中提取可读正文作为兜底。"""
         context = None
@@ -834,7 +861,7 @@ class XiaoheihePlugin(Star):
                             if self.link_text_include_images and block.get("type") == "image":
                                 img_bytes = await self._download_image(block.get("url"))
                                 if img_bytes:
-                                    block["image_bytes"] = img_bytes
+                                    block["image_bytes"] = self._compress_image_if_needed(img_bytes)
                         return content
                 except Exception as e:
                     self._log(f"网页中真实 link_id 二次解析失败: {e}")
@@ -895,13 +922,18 @@ class XiaoheihePlugin(Star):
                     continue
                 image_bytes = await self._download_image(image_url)
                 if image_bytes:
-                    blocks.append({"type": "image", "url": image_url, "image_bytes": image_bytes})
+                    blocks.append({
+                        "type": "image",
+                        "url": image_url,
+                        "image_bytes": self._compress_image_if_needed(image_bytes),
+                    })
 
             return {
                 "title": title,
                 "author": "",
                 "publish_time": "",
                 "blocks": blocks,
+                "source_url": target_url,
             }
         except Exception as e:
             self._log(f"网页兜底解析失败: {e}")
@@ -1027,7 +1059,7 @@ class XiaoheihePlugin(Star):
 
     def _parse_bbs_content(self, payload: dict, source_url: str) -> dict:
         """从 bbs/app/link/tree 响应中提取标题/作者/时间与按原文顺序的图文块。"""
-        result = {"title": "", "author": "", "publish_time": "", "blocks": []}
+        result = {"title": "", "author": "", "publish_time": "", "blocks": [], "source_url": source_url}
 
         body = payload.get("result") or payload.get("data") or {}
         if not isinstance(body, dict):
@@ -1270,7 +1302,7 @@ class XiaoheihePlugin(Star):
 
     def _parse_game_content(self, payload: dict, source_url: str) -> dict:
         """从游戏详情 API 响应中提取可读的文字与媒体。"""
-        result = {"title": "", "author": "", "publish_time": "", "blocks": []}
+        result = {"title": "", "author": "", "publish_time": "", "blocks": [], "source_url": source_url}
 
         body = payload.get("result") or payload.get("data") or {}
         if not isinstance(body, dict):
@@ -1508,6 +1540,55 @@ class XiaoheihePlugin(Star):
             self._log(f"下载图片失败 {url}: {e}")
         return None
 
+    def _compress_image_if_needed(self, image_bytes: bytes) -> bytes:
+        """把过大的图片压到发送体积上限内，避免官方机器人上传 413。
+
+        官方机器人（qq_official）上传媒体体积限制很严，原图直传常报
+        413 Request Entity Too Large。这里在超过阈值时用 Pillow 逐步
+        降低分辨率与 JPEG 质量，直到落入阈值；压缩失败则原样返回。
+        """
+        if not image_bytes:
+            return image_bytes
+        limit_kb = self.link_image_size_limit_kb
+        if limit_kb <= 0 or len(image_bytes) <= limit_kb * 1024:
+            return image_bytes
+        try:
+            import io
+            from PIL import Image
+
+            limit_bytes = limit_kb * 1024
+            with Image.open(io.BytesIO(image_bytes)) as im:
+                im = im.convert("RGB")
+                width, height = im.size
+                quality = 85
+                for _ in range(8):
+                    buffer = io.BytesIO()
+                    im.save(buffer, format="JPEG", quality=quality, optimize=True)
+                    data = buffer.getvalue()
+                    if len(data) <= limit_bytes:
+                        self._log(
+                            f"图片已压缩至 {len(data) // 1024}KB "
+                            f"(原 {len(image_bytes) // 1024}KB)"
+                        )
+                        return data
+                    # 优先降质量，质量到底后再缩分辨率。
+                    if quality > 45:
+                        quality -= 15
+                        continue
+                    width = int(width * 0.8)
+                    height = int(height * 0.8)
+                    if width < 320 or height < 320:
+                        self._log(
+                            f"图片压缩到最小仍为 {len(data) // 1024}KB，按此发送"
+                        )
+                        return data
+                    im = im.resize((width, height), Image.LANCZOS)
+                    quality = 70
+                return data
+        except Exception as e:
+            self._log(f"压缩图片失败，使用原图: {e}")
+            return image_bytes
+
     def _extract_bbs_video_url(self, payload: dict) -> str:
         """从 bbs/app/link/tree 响应中提取帖子视频直链。
 
@@ -1633,6 +1714,235 @@ class XiaoheihePlugin(Star):
             deduped.append(block)
         return deduped
 
+    def _get_platform_name(self, event: AstrMessageEvent) -> str:
+        """获取当前平台名，用于判断是否支持合并转发。"""
+        try:
+            name = event.get_platform_name()
+            if name:
+                return str(name).strip().lower()
+        except Exception:
+            pass
+        try:
+            meta = getattr(event, "platform_meta", None)
+            name = getattr(meta, "name", None)
+            if name:
+                return str(name).strip().lower()
+        except Exception:
+            pass
+        # 退回从 UMO 前缀取平台名（格式：平台名:消息类型:ID）。
+        umo = self._get_session_umo(event)
+        if umo and ":" in umo:
+            return umo.split(":", 1)[0].strip().lower()
+        return ""
+
+    def _supports_forward(self, event: AstrMessageEvent) -> bool:
+        """判断当前平台是否支持合并转发。
+
+        官方机器人（qq_official）、webchat 等无法发送合并转发，需回退为普通消息。
+        """
+        platform = self._get_platform_name(event)
+        no_forward_platforms = {
+            "qq_official",
+            "qqofficial",
+            "wecom",
+            "wechat",
+            "weixin",
+            "webchat",
+            "dingtalk",
+            "lark",
+            "feishu",
+            "slack",
+            "telegram",
+            "discord",
+        }
+        return platform not in no_forward_platforms
+
+    async def _yield_link_content(self, event: AstrMessageEvent, content: dict):
+        """按当前平台能力发送解析结果。
+
+        - auto：支持合并转发的平台走合并转发，官方机器人等自动回退普通图文；
+        - forward：强制合并转发；
+        - plain：强制普通图文消息；
+        - markdown：优先用 QQ 官方 markdown 图文（需机器人有 markdown 权限），
+          失败自动回退为普通图文。
+        合并转发/markdown 失败时都会自动回退为普通消息。
+        """
+        mode = self.link_text_send_mode
+        max_images = self._platform_max_images_per_message(event)
+
+        content["_sent"] = False
+
+        # markdown 模式：优先尝试 QQ 官方原生 markdown 图文混排。
+        if mode == "markdown":
+            if await self._try_send_qq_markdown(event, content):
+                content["_sent"] = True
+                return
+            for chain in self._build_link_plain_chains(content, max_images):
+                content["_sent"] = True
+                yield event.chain_result(chain)
+            return
+
+        use_forward = mode == "forward" or (mode != "plain" and self._supports_forward(event))
+
+        if use_forward:
+            nodes = self._build_link_forward_nodes(content, self._get_forward_uin(event))
+            if nodes:
+                try:
+                    yield event.chain_result(nodes)
+                    content["_sent"] = True
+                    return
+                except Exception as e:
+                    self._log(f"合并转发发送失败，回退为普通消息: {e}")
+
+        # 普通消息回退：按原文顺序发送图文，按平台单条图片上限分条。
+        chains = self._build_link_plain_chains(content, max_images)
+        for chain in chains:
+            content["_sent"] = True
+            yield event.chain_result(chain)
+
+    def _platform_max_images_per_message(self, event: AstrMessageEvent) -> int:
+        """返回当前平台单条消息可携带的图片数上限。
+
+        QQ 官方机器人、企业微信的富媒体消息一次只能带一张图片，
+        因此需要按「一段文字 + 一张图」的方式交错分条，才能让图文贴合。
+        """
+        single_image_platforms = {
+            "qq_official",
+            "qqofficial",
+            "wecom",
+            "wecom_ai_bot",
+            "wechat",
+            "weixin",
+        }
+        if self._get_platform_name(event) in single_image_platforms:
+            return 1
+        return 20
+
+    def _build_qq_markdown(self, content: dict) -> str:
+        """把解析结果拼成 QQ 官方 markdown 图文内容。
+
+        依据官方文档：内嵌图片需公网可访问的 http(s) 链接，且必须标注
+        宽高（![alt #宽px #高px#](url)）才能渲染；单条内容建议 <= 2000 字。
+        """
+        lines: list[str] = []
+        title = str(content.get("title") or "").strip()
+        if title:
+            lines.append(f"# {title}")
+        meta_parts = []
+        if content.get("author"):
+            meta_parts.append(str(content["author"]).strip())
+        if content.get("publish_time"):
+            meta_parts.append(str(content["publish_time"]).strip())
+        if meta_parts:
+            lines.append("> " + " · ".join(meta_parts))
+
+        def md_image(block) -> str:
+            url = str(block.get("url") or "").strip()
+            if not url or not url.startswith("http"):
+                return ""
+            # 小黑盒 CDN 反斜杠原图技巧在 markdown 里不适用，去掉尾部反斜杠。
+            url = url.rstrip("\\")
+            width, height = self._probe_image_size(block.get("image_bytes"))
+            if width and height:
+                # 限制在文档建议的 720x1080 内，并保持比例。
+                width, height = self._clamp_markdown_size(width, height)
+                return f"![img #{width}px #{height}px#]({url})"
+            return f"![img]({url})"
+
+        cover_url = ""  # 封面用正文首图即可，避免重复
+        for block in content.get("blocks") or []:
+            block_type = block.get("type")
+            if block_type == "text" and block.get("text"):
+                text = self._clean_html(str(block["text"])).strip()
+                if text:
+                    lines.append(text)
+            elif block_type == "image":
+                img_md = md_image(block)
+                if img_md:
+                    lines.append(img_md)
+            elif block_type == "game_card":
+                appid = str(block.get("appid") or "").strip()
+                if appid:
+                    lines.append(f"相关游戏：{appid}")
+
+        source_url = str(content.get("source_url") or "").strip()
+        if source_url:
+            lines.append(f"🔗 [点击查看原文]({source_url})")
+
+        markdown = "\n\n".join(part for part in lines if part).strip()
+        if len(markdown) > 2000:
+            markdown = markdown[:1990].rstrip() + "\n\n…"
+        return markdown
+
+    def _probe_image_size(self, image_bytes) -> tuple[int, int]:
+        """从图片字节读取宽高，失败返回 (0, 0)。"""
+        if not image_bytes:
+            return (0, 0)
+        try:
+            import io
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image_bytes)) as im:
+                return (int(im.width), int(im.height))
+        except Exception:
+            return (0, 0)
+
+    def _clamp_markdown_size(self, width: int, height: int) -> tuple[int, int]:
+        """按官方建议把图片宽高等比限制在 720x1080 内。"""
+        max_w, max_h = 720, 1080
+        if width <= 0 or height <= 0:
+            return (width, height)
+        ratio = min(max_w / width, max_h / height, 1.0)
+        return (max(1, int(width * ratio)), max(1, int(height * ratio)))
+
+    async def _try_send_qq_markdown(self, event: AstrMessageEvent, content: dict) -> bool:
+        """尝试通过 QQ 官方接口发送原生 markdown 图文。
+
+        仅在 qq_official 平台生效；失败（无权限/接口异常/非官方平台）
+        时返回 False，由调用方回退为普通图文。
+        """
+        if self._get_platform_name(event) not in {"qq_official", "qqofficial"}:
+            return False
+        try:
+            markdown = self._build_qq_markdown(content)
+            if not markdown:
+                return False
+
+            bot = getattr(event, "bot", None)
+            api = getattr(bot, "api", None)
+            if api is None:
+                self._log("QQ 官方 markdown：未取到 bot.api，回退普通图文")
+                return False
+
+            msg_obj = getattr(event, "message_obj", None)
+            raw = getattr(msg_obj, "raw_message", None)
+            msg_id = getattr(msg_obj, "message_id", None) or getattr(raw, "id", None)
+            group_openid = getattr(raw, "group_openid", None)
+            author = getattr(raw, "author", None)
+            user_openid = (
+                getattr(author, "user_openid", None)
+                or getattr(author, "member_openid", None)
+                or getattr(raw, "user_openid", None)
+            )
+
+            payload = {"msg_type": 2, "markdown": {"content": markdown}}
+            if msg_id:
+                payload["msg_id"] = msg_id
+
+            if group_openid:
+                await api.post_group_message(group_openid=group_openid, **payload)
+            elif user_openid:
+                await api.post_c2c_message(openid=user_openid, **payload)
+            else:
+                self._log("QQ 官方 markdown：未取到会话 openid，回退普通图文")
+                return False
+
+            self._log("QQ 官方 markdown 图文发送完成")
+            return True
+        except Exception as e:
+            self._log(f"QQ 官方 markdown 发送失败，回退普通图文: {e}")
+            return False
+
     def _build_link_forward_nodes(self, content: dict, uin: str):
         """将解析结果按原文顺序组装为一个合并转发中的多条记录节点。"""
         components = []
@@ -1690,9 +2000,94 @@ class XiaoheihePlugin(Star):
                     components.append(Comp.Plain(f"相关游戏：{appid}"))
 
         flush_text_node()
+        source_url = str(content.get("source_url") or "").strip()
+        if source_url:
+            components.append(Comp.Plain(f"\n点击查看原文：\n{source_url}"))
         if not components:
             return []
         return [Comp.Node(components, uin=uin, name=nickname)]
+
+    def _build_link_plain_chains(self, content: dict, max_images_per_chain: int = 20) -> list:
+        """将解析结果组装为普通消息链（合并转发的回退方案）。
+
+        尽量把图文放进同一条消息里（保持原文顺序的图文混排），按平台单条
+        图片上限分条：多数平台可放多张，QQ 官方/企业微信一次只带一张图，
+        此时会自动按「一段文字 + 一张图」交错分条，让图文尽量贴合。
+        """
+        chains: list = []
+        current: list = []
+        image_count_in_chain = 0
+        try:
+            max_images_per_chain = max(1, int(max_images_per_chain))
+        except Exception:
+            max_images_per_chain = 20
+
+        def flush_chain():
+            nonlocal current, image_count_in_chain
+            if current:
+                chains.append(current)
+                current = []
+                image_count_in_chain = 0
+
+        cover_bytes = content.get("cover_bytes")
+        if cover_bytes:
+            try:
+                current.append(Comp.Image.fromBytes(cover_bytes))
+                image_count_in_chain += 1
+            except Exception as e:
+                self._log(f"构造封面图片失败: {e}")
+
+        header_lines = []
+        if content.get("title"):
+            header_lines.append(str(content["title"]).strip())
+        meta_parts = []
+        if content.get("author"):
+            meta_parts.append(str(content["author"]).strip())
+        if content.get("publish_time"):
+            meta_parts.append(str(content["publish_time"]).strip())
+        if meta_parts:
+            header_lines.append(" · ".join(meta_parts))
+        if header_lines:
+            current.append(Comp.Plain("\n".join(header_lines).strip() + "\n"))
+
+        pending_text: list[str] = []
+
+        def flush_text():
+            nonlocal pending_text
+            if pending_text:
+                current.append(Comp.Plain("\n\n".join(pending_text).strip()))
+                pending_text = []
+
+        for block in content.get("blocks") or []:
+            block_type = block.get("type")
+            if block_type == "text" and block.get("text"):
+                text = self._clean_html(str(block["text"]))
+                if text:
+                    pending_text.append(text)
+                continue
+
+            if block_type == "image" and block.get("image_bytes"):
+                flush_text()
+                if image_count_in_chain >= max_images_per_chain:
+                    flush_chain()
+                try:
+                    current.append(Comp.Image.fromBytes(block["image_bytes"]))
+                    image_count_in_chain += 1
+                except Exception as e:
+                    self._log(f"构造图片节点失败: {e}")
+                continue
+
+            if block_type == "game_card":
+                appid = str(block.get("appid") or "").strip()
+                if appid:
+                    pending_text.append(f"相关游戏：{appid}")
+
+        flush_text()
+        source_url = str(content.get("source_url") or "").strip()
+        if source_url:
+            current.append(Comp.Plain(f"\n点击查看原文：\n{source_url}"))
+        flush_chain()
+        return [chain for chain in chains if chain]
 
     def _iter_url_text_candidates(self, value):
         """递归展开消息载荷中的所有字符串候选，尽量找出被转义或嵌套的 URL。"""
