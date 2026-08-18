@@ -1743,6 +1743,7 @@ class XiaoheihePlugin(Star):
         platform = self._get_platform_name(event)
         no_forward_platforms = {
             "qq_official",
+            "qq_official_webhook",
             "qqofficial",
             "wecom",
             "wechat",
@@ -1808,6 +1809,7 @@ class XiaoheihePlugin(Star):
         """
         single_image_platforms = {
             "qq_official",
+            "qq_official_webhook",
             "qqofficial",
             "wecom",
             "wecom_ai_bot",
@@ -1898,10 +1900,10 @@ class XiaoheihePlugin(Star):
     async def _try_send_qq_markdown(self, event: AstrMessageEvent, content: dict) -> bool:
         """尝试通过 QQ 官方接口发送原生 markdown 图文。
 
-        仅在 qq_official 平台生效；失败（无权限/接口异常/非官方平台）
+        在 qq_official / qq_official_webhook 平台生效；失败（无权限/接口异常/非官方平台）
         时返回 False，由调用方回退为普通图文。
         """
-        if self._get_platform_name(event) not in {"qq_official", "qqofficial"}:
+        if self._get_platform_name(event) not in {"qq_official", "qq_official_webhook", "qqofficial"}:
             return False
         try:
             markdown = self._build_qq_markdown(content)
@@ -1933,8 +1935,10 @@ class XiaoheihePlugin(Star):
                 await api.post_group_message(group_openid=group_openid, **payload)
             elif user_openid:
                 await api.post_c2c_message(openid=user_openid, **payload)
+            elif getattr(raw, "channel_id", None):
+                await api.post_message(channel_id=raw.channel_id, **payload)
             else:
-                self._log("QQ 官方 markdown：未取到会话 openid，回退普通图文")
+                self._log("QQ 官方 markdown：未取到会话 openid 或 channel_id，回退普通图文")
                 return False
 
             self._log("QQ 官方 markdown 图文发送完成")
